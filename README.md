@@ -5,7 +5,7 @@
 Install the project in editable mode from the repo root so that `models` and its subpackages are importable from anywhere:
 
 ```bash
-pip install -e .
+python -m pip install -e .
 ```
 
 After that you can import from `models` in any file:
