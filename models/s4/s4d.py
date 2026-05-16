@@ -105,3 +105,75 @@ class S4D(nn.Module):
         y = self.output_linear(y.transpose(-1, -2)).transpose(-1, -2)
         if not self.transposed: y = y.transpose(-1, -2)
         return y, None # Return a dummy state to satisfy this repo's interface, but this can be modified
+
+
+class S4DBlock(nn.Module):
+    """Pre-norm блок: RMSNorm → S4D → residual → FF"""
+    def __init__(self, d_model, d_state=64, ff_mult=2, dropout=0.0):
+        super().__init__()
+        self.norm1 = nn.RMSNorm(d_model)
+        self.s4d   = S4D(d_model, d_state=d_state, dropout=dropout)
+
+        # Pointwise FF (как в Transformer)
+        self.norm2 = nn.RMSNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_model * ff_mult),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * ff_mult, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        out, _ = self.s4d(self.norm1(x).transpose(-1, -2))
+        x = x + out.transpose(-1, -2)
+        x = x + self.ff(self.norm2(x))
+        return x
+
+
+class S4DLanguageModel(nn.Module):
+    """
+    S4D LM ~130M параметров:
+      d_model=768, n_layers=12, d_state=64
+    (S4D тяжелее Mamba по d_state, поэтому слоёв меньше)
+    """
+    def __init__(
+        self,
+        vocab_size:  int,
+        d_model:     int = 768,
+        n_layers:    int = 24,
+        d_state:     int = 64,
+        ff_mult:     int = 2,
+        dropout:     float = 0.0,
+        pad_vocab_size_multiple: int = 8,
+    ):
+        super().__init__()
+
+        if vocab_size % pad_vocab_size_multiple:
+            vocab_size += pad_vocab_size_multiple - vocab_size % pad_vocab_size_multiple
+
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.layers = nn.ModuleList([
+            S4DBlock(d_model, d_state=d_state, ff_mult=ff_mult, dropout=dropout)
+            for _ in range(n_layers)
+        ])
+        self.norm_f  = nn.RMSNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head.weight = self.embedding.weight          # weight tying
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.embedding.weight, std=0.02)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, input_ids):
+        x = self.embedding(input_ids)   # (B, L, d_model)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm_f(x)
+        return self.lm_head(x)          # (B, L, vocab_size)
