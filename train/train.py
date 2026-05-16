@@ -39,16 +39,22 @@ from train_data.data_loader import ShardedDataLoader, ValDataLoader
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+def ensure_dir(path):
+    """Create directory if it doesn't exist."""
+    os.makedirs(path, exist_ok=True)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Train Mamba / FantasticSSM with DDP")
 
     # paths
     p.add_argument("--data_dir",       default="./data/train")
     p.add_argument("--val_dir",        default="./data/val")
-    p.add_argument("--checkpoint_dir", default="./checkpoints")
+    p.add_argument("--checkpoint_dir", default="./experiments/checkpoints")
 
     # model
     p.add_argument("--model",       choices=["mamba", "fantastic"], default="mamba")
+    p.add_argument("--model_name",  type=str)
     p.add_argument("--vocab_size",  type=int,   default=50257)
     p.add_argument("--d_model",     type=int,   default=768)
     p.add_argument("--n_layers",    type=int,   default=24)
@@ -78,7 +84,12 @@ def parse_args():
     # resume
     p.add_argument("--resume", default=None, help="path to checkpoint to resume from")
 
-    return p.parse_args()
+    args = p.parse_args()
+    checkpoint_path = os.path.join(args.checkpoint_dir, args.model_name)
+    ensure_dir(checkpoint_path)
+    args.checkpoint_dir = checkpoint_path
+
+    return args
 
 
 # ── DDP helpers ───────────────────────────────────────────────────────────────
@@ -106,16 +117,19 @@ def build_model(args) -> nn.Module:
             d_conv=args.d_conv,
             expand=args.expand,
         )
-    return FantasticSSM130M(
-        vocab_size=args.vocab_size,
-        d_model=args.d_model,
-        n_layers=args.n_layers,
-        num_experts=args.num_experts,
-        top_k=args.top_k,
-        d_state=args.d_state,
-        d_conv=args.d_conv,
-        expand=args.expand,
-    )
+    elif args.model == "fantastic":
+        return FantasticSSM130M(
+            vocab_size=args.vocab_size,
+            d_model=args.d_model,
+            n_layers=args.n_layers,
+            num_experts=args.num_experts,
+            top_k=args.top_k,
+            d_state=args.d_state,
+            d_conv=args.d_conv,
+            expand=args.expand,
+        )
+    else:
+        raise ValueError("Invalid model ензу")
 
 
 # ── Optimizer ─────────────────────────────────────────────────────────────────

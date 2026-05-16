@@ -3,3 +3,6 @@ train_data/data/*
 
 *.egg-info
 *__pycache__*
+
+*checkpoints*
+*tensorboard_logs*
