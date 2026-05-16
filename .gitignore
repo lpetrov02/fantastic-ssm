@@ -1,2 +1,5 @@
 *ipynb*
 train_data/data/*
+
+*.egg-info
+*__pycache__*

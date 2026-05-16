@@ -81,8 +81,8 @@ class S4D(nn.Module):
 
         # position-wise output transform to mix features
         self.output_linear = nn.Sequential(
-            nn.Conv1d(self.h, 2*self.h, kernel_size=1),
-            nn.GLU(dim=-2),
+            nn.Linear(self.h, 2*self.h),
+            nn.GLU(dim=-1),
         )
 
     def forward(self, u, **kwargs): # absorbs return_output and transformer src mask
@@ -102,6 +102,6 @@ class S4D(nn.Module):
         y = y + u * self.D.unsqueeze(-1)
 
         y = self.dropout(self.activation(y))
-        y = self.output_linear(y)
+        y = self.output_linear(y.transpose(-1, -2)).transpose(-1, -2)
         if not self.transposed: y = y.transpose(-1, -2)
         return y, None # Return a dummy state to satisfy this repo's interface, but this can be modified
