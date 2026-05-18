@@ -200,3 +200,6 @@ class TokenTopKRouter(nn.Module):
         if self.lb_strategy == "lbl" and self.last_lb_loss is not None:
             return self.last_lb_loss
         return self.proj.weight.new_zeros(())
+
+    def get_entropy(self) -> float | None:
+        return getattr(self, "last_entropy", None)

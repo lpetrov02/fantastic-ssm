@@ -188,6 +188,17 @@ def collect_aux_loss(raw_model: nn.Module):
     return total  # None for plain Mamba
 
 
+def collect_router_entropies(raw_model: nn.Module) -> list:
+    # Returns per-layer entropy floats; empty list for models without routers.
+    entropies = []
+    for module in raw_model.modules():
+        if hasattr(module, "get_entropy"):
+            e = module.get_entropy()
+            if e is not None:
+                entropies.append(e)
+    return entropies
+
+
 # ── Checkpointing ─────────────────────────────────────────────────────────────
 
 def save_checkpoint(step: int, raw_model: nn.Module, optimizer, args) -> Path:
@@ -334,12 +345,24 @@ def main():
         if is_main and step % args.log_every == 0:
             t1 = time.perf_counter()
             tok_per_sec = tokens_per_log / (t1 - t0)
+
+            entropies = collect_router_entropies(raw_model)
+            entropy_str = ""
+            if entropies:
+                mean_h = sum(entropies) / len(entropies)
+                entropy_str = f" | H {mean_h:.3f}"
+                writer.add_scalar("router/entropy/mean", mean_h,          step)
+                writer.add_scalar("router/entropy/min",  min(entropies),   step)
+                writer.add_scalar("router/entropy/max",  max(entropies),   step)
+                for i, h in enumerate(entropies):
+                    writer.add_scalar(f"router/entropy/layer_{i}", h, step)
+
             print(
                 f"step {step:7d} | loss {accum_loss:.4f} | lr {lr:.2e}"
-                f" | {tok_per_sec / 1e3:.1f}k tok/s"
+                f" | {tok_per_sec / 1e3:.1f}k tok/s{entropy_str}"
             )
-            writer.add_scalar("train/loss",          accum_loss,  step)
-            writer.add_scalar("train/lr",            lr,          step)
+            writer.add_scalar("train/loss",           accum_loss,  step)
+            writer.add_scalar("train/lr",             lr,          step)
             writer.add_scalar("train/tokens_per_sec", tok_per_sec, step)
             t0 = t1
 
