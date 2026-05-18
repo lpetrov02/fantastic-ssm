@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from models.mamba.mamba import Mamba130M
 from models.fantastic.fantastic_ssm import FantasticSSM130M
+from models.s4.s4d import S4DLanguageModel
 from train_data.data_loader import ShardedDataLoader, ValDataLoader
 
 
@@ -53,7 +54,7 @@ def parse_args():
     p.add_argument("--checkpoint_dir", default="./experiments/checkpoints")
 
     # model
-    p.add_argument("--model",       choices=["mamba", "fantastic"], default="mamba")
+    p.add_argument("--model",       choices=["mamba", "fantastic", "s4d"], default="mamba")
     p.add_argument("--model_name",  type=str)
     p.add_argument("--vocab_size",  type=int,   default=50257)
     p.add_argument("--d_model",     type=int,   default=768)
@@ -63,6 +64,8 @@ def parse_args():
     p.add_argument("--expand",      type=int,   default=2)
     p.add_argument("--num_experts", type=int,   default=8,   help="FantasticSSM only")
     p.add_argument("--top_k",       type=int,   default=1,   help="FantasticSSM only")
+    p.add_argument("--dropout",       type=float,   default=0.0,   help="S4DLanguageModel only")
+    p.add_argument("--ff_mult",       type=int,   default=2,   help="S4DLanguageModel only")
 
     # training
     p.add_argument("--seq_len",          type=int,   default=2048)
@@ -128,8 +131,17 @@ def build_model(args) -> nn.Module:
             d_conv=args.d_conv,
             expand=args.expand,
         )
+    elif args.model == "s4d":
+        return S4DLanguageModel(
+            vocab_size=args.vocab_size,
+            d_model=args.d_model,
+            n_layers=args.n_layers,
+            d_state=args.d_state,
+            ff_mult=args.ff_mult,
+            dropout=args.dropout,
+        )
     else:
-        raise ValueError("Invalid model ензу")
+        raise ValueError("Invalid model type")
 
 
 # ── Optimizer ─────────────────────────────────────────────────────────────────
