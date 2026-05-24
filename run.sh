@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
+CUDA_VISIBLE_DEVICES=4,5,6,7 \
 torchrun --standalone --nproc_per_node=4 train/train.py \
     --model fantastic \
     --data_dir ./train_data/data/train \
@@ -7,11 +7,11 @@ torchrun --standalone --nproc_per_node=4 train/train.py \
     --batch_size 16         \
     --grad_accum_steps 4   \
     --max_steps 100000     \
-    --num_experts 1 \
-    --top_k 1 \
-    --model_name "fantastic-130m-e1a1"
+    --num_experts 64 \
+    --top_k 8 \
+    --dt_strategy linspace \
+    --model_name "fantastic-130m-e64a8-linspace"
 
-    # --dt_strategy logspace \
     # --lb_strategy "aux_free" \
     # --lb_coef 0.001 \
     # --dropout 0.1 \

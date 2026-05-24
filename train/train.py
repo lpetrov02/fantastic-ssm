@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from models.mamba.mamba import Mamba130M
 from models.fantastic.fantastic_ssm import FantasticSSM
+from models.fantastic.fantastic_v0 import Fantastic_v0_SSM
 from models.s4.s4d import S4DLanguageModel
 from train_data.data_loader import ShardedDataLoader, ValDataLoader
 
@@ -54,7 +55,7 @@ def parse_args():
     p.add_argument("--checkpoint_dir", default="./experiments/checkpoints")
 
     # model
-    p.add_argument("--model",       choices=["mamba", "fantastic", "s4d"], default="mamba")
+    p.add_argument("--model",       choices=["mamba", "fantastic", "fantastic_v0", "s4d"], default="mamba")
     p.add_argument("--model_name",  type=str)
     p.add_argument("--vocab_size",  type=int,   default=50257)
     p.add_argument("--d_model",     type=int,   default=768)
@@ -69,6 +70,8 @@ def parse_args():
     p.add_argument("--lb_coef",            type=float,   default=0.01,   help="Fantastic only")
     p.add_argument("--aux_free_bias_step", type=float,   default=0.001,   help="Fantastic only")
     p.add_argument("--dt_strategy", type=str,   default="random",   help="Fantastic only")
+    p.add_argument("--basis_mode", action="store_true", help="Fantastic_mode")
+    p.add_argument("--orthogonal_loss_coef", type="float", default=0.0, help="Fantastic only")
 
     p.add_argument("--dropout",       type=float,   default=0.0,   help="S4DLanguageModel only")
     p.add_argument("--ff_mult",       type=int,   default=2,   help="S4DLanguageModel only")
@@ -140,6 +143,23 @@ def build_model(args) -> nn.Module:
             lb_coef=args.lb_coef,
             aux_free_bias_step=args.aux_free_bias_step,
             dt_strategy=args.dt_strategy,
+            basis_mode=args.basis_mode,
+            orthogonal_loss_coef=args.orthogonal_loss_coef,
+        )
+    elif args.model == "fantastic_v0":
+        return Fantastic_v0_SSM(
+            vocab_size=args.vocab_size,
+            d_model=args.d_model,
+            n_layers=args.n_layers,
+            num_experts=args.num_experts,
+            top_k=args.top_k,
+            d_state=args.d_state,
+            lb_strategy=args.lb_strategy,
+            lb_coef=args.lb_coef,
+            aux_free_bias_step=args.aux_free_bias_step,
+            dt_strategy=args.dt_strategy,
+            ff_mult=args.ff_mult,
+            dropout=args.dropout,
         )
     elif args.model == "s4d":
         return S4DLanguageModel(
@@ -194,7 +214,8 @@ def collect_aux_loss(raw_model: nn.Module):
     for module in raw_model.modules():
         if hasattr(module, "get_auxiliary_loss"):
             loss = module.get_auxiliary_loss()
-            total = loss if total is None else total + loss
+            if loss is not None:
+                total = loss if total is None else total + loss
     return total  # None for plain Mamba
 
 
@@ -337,8 +358,10 @@ def main():
                 loss = loss / args.grad_accum_steps
                 aux = collect_aux_loss(raw_model)
                 if aux is not None:
-                    loss = loss + aux / args.grad_accum_steps
-                loss.backward()
+                    total_loss = loss + aux / args.grad_accum_steps
+                else:
+                    total_loss = loss
+                total_loss.backward()
 
             accum_loss += loss.item()
 

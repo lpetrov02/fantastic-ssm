@@ -27,28 +27,22 @@ except ImportError:
 from utils.token_router.router import TokenTopKRouter
 
 
-class Fantastic(nn.Module):
+class Fantastic_v0(nn.Module):
 
     def __init__(
         self,
         d_model,
         d_state: int = 16,
-        d_conv:int = 4,
-        expand: int = 2,
         num_experts: int = 4,
         top_k: int = 1,
         dropout: float = 0.0,
         dt_min: float = 0.001,
         dt_max: float = 0.1,
-        conv_bias: bool = True,
-        bias: bool = False,
         layer_idx = None,
         lb_strategy: str = "none",
         lb_coef: float = 0.01,
         aux_free_bias_step: float = 1e-3,
         dt_strategy: str = "random",
-        basis_mode: bool = False,
-        orthogonal_loss_coef: float = 0.0,
         device = None,
         dtype = None,
         **kwargs
@@ -57,40 +51,21 @@ class Fantastic(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         self.d_model = d_model
         self.d_state = d_state
-        self.d_conv = d_conv
-        self.expand = expand
-        self.d_inner = int(self.expand * self.d_model)
+        self.d_inner = self.d_model
         self.layer_idx = layer_idx
         self.num_experts = num_experts
         self.top_k = top_k
         self.dt_strategy = dt_strategy
 
-        self.basis_mode = basis_mode
-        self.orthogonal_loss_coef = orthogonal_loss_coef
-        self.last_orthogonal_loss = None
-
-        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
-        self.d_conv = d_conv
-        self.conv1d = nn.Conv1d(
-            in_channels=self.d_inner,
-            out_channels=self.d_inner,
-            bias=conv_bias,
-            kernel_size=d_conv,
-            groups=self.d_inner,
-            padding=d_conv - 1,
-            **factory_kwargs,
-        ) if d_conv > 0 else nn.Identity()
         self.router = TokenTopKRouter(
             self.d_inner,
             self.num_experts,
             self.top_k,
             lb_strategy,
             lb_coef,
-            aux_free_bias_step,
-            basis_mode,
+            aux_free_bias_step
         )
 
         self.activation = "silu"
@@ -101,13 +76,15 @@ class Fantastic(nn.Module):
             log_dt = torch.rand(self.num_experts, self.d_inner) \
                 * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
         elif dt_strategy == "linspace":
-            dts = torch.linspace(dt_min, dt_max, self.num_experts + 1)
+            dt_min = torch.linspace(dt_min, dt_max, self.num_experts + 1)[:-1, None]
+            dt_max = torch.linspace(dt_min, dt_max, self.num_experts + 1)[1:, None]
             log_dt = torch.rand(self.num_experts, self.d_inner) \
-                * (torch.log(dts[1:, None]) - torch.log(dts[:-1, None])) + torch.log(dts[:-1, None])
+                * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
         elif dt_strategy == "logspace":
-            dts = torch.logspace(dt_min, dt_max, self.num_experts + 1)
+            dt_min = torch.logspace(dt_min, dt_max, self.num_experts + 1)[:-1, None]
+            dt_max = torch.logspace(dt_min, dt_max, self.num_experts + 1)[1:, None]
             log_dt = torch.rand(self.num_experts, self.d_inner) \
-                * (torch.log(dts[1:, None]) - torch.log(dts[:-1, None])) + torch.log(dts[:-1, None])
+                * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
         else:
             raise ValueError(f"Unknown dt strategy: {dt_strategy}")
         self.log_dt = nn.Parameter(log_dt)
@@ -142,15 +119,6 @@ class Fantastic(nn.Module):
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
         """
-
-        if self.training and self.orthogonal_loss_coef > 0:
-            self.last_orthogonal_loss = torch.tensor(0.0, requires_grad=True, device=hidden_states.device)
-            params = (self.log_dt, self.B, self.C)
-            for param in params:
-                W = F.normalize(param, dim=1)
-                self.last_orthogonal_loss += (W @ W.T - torch.eye(W.size(0), device=W.device)).pow(2).sum()
-            self.last_orthogonal_loss *= self.orthogonal_loss_coef
-
         # print(f"mixer: {type(hidden_states)}")
         batch, seqlen, dim = hidden_states.shape
 
@@ -163,30 +131,8 @@ class Fantastic(nn.Module):
                 return out
 
         # We do matmul and transpose BLH -> HBL at the same time
-        xz = self.in_proj(hidden_states)
-        x, z = xz.chunk(2, dim=-1)  # (B, L, H) each
-        x, z = x.transpose(-1, -2), z.transpose(-1, -2)
-
+        x = hidden_states.transpose(-1, -2)
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
-
-        # Compute short convolution
-
-        if conv_state is not None:
-            conv_state.copy_(x[:, :, -self.d_conv :])  # Update state (B D W)
-        if self.d_conv > 0:
-            if causal_conv1d_fn is None:
-                x = self.act(self.conv1d(x)[..., :seqlen])
-            else:
-                assert self.activation in ["silu", "swish"]
-                weight = rearrange(self.conv1d.weight, "d 1 w -> d w")
-                # print(x.shape, weight.shape)
-                x = causal_conv1d_fn(
-                    x,
-                    weight=weight,
-                    bias=self.conv1d.bias,
-                    activation=self.activation,
-                    seq_idx=None,
-                )
 
         alpha, _ = self.router(
             x,
@@ -208,7 +154,7 @@ class Fantastic(nn.Module):
             B,
             C,
             self.D.float(),
-            z=z,
+            z=None,
             delta_softplus=True,
             return_last_state=ssm_state is not None,
         )
@@ -216,32 +162,12 @@ class Fantastic(nn.Module):
             y, last_state = y
             ssm_state.copy_(last_state)
         y = rearrange(y, "b d l -> b l d")
-        out = self.out_proj(y)
-        return out
+        return y
 
     def step(self, hidden_states, conv_state, ssm_state):
         dtype = hidden_states.dtype
         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
-        xz = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
-        x, z = xz.chunk(2, dim=-1)  # (B D)
-
-        # Conv step
-        if self.d_conv > 0:
-            if causal_conv1d_update is None:
-                conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
-                conv_state[:, :, -1] = x
-                x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
-                if self.conv1d.bias is not None:
-                    x = x + self.conv1d.bias
-                x = self.act(x).to(dtype=dtype)
-            else:
-                x = causal_conv1d_update(
-                    x,
-                    conv_state,
-                    rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                    self.conv1d.bias,
-                    self.activation,
-                )
+        x = hidden_states.squeeze(1)  # (B 2D)
 
         alpha, _ = self.router(
             x,
@@ -265,14 +191,12 @@ class Fantastic(nn.Module):
             ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
             y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)
             y = y + self.D.to(dtype) * x
-            y = y * self.act(z)  # (B D)
         else:
             y = selective_state_update(
-                ssm_state, x, dt, A, B, C, self.D, z=z, dt_bias=self.dt_proj.bias, dt_softplus=True
+                ssm_state, x, dt, A, B, C, self.D, z=None, dt_bias=self.dt_proj.bias, dt_softplus=True
             )
 
-        out = self.out_proj(y)
-        return out.unsqueeze(1), conv_state, ssm_state
+        return y.unsqueeze(1), conv_state, ssm_state
     
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         device = self.out_proj.weight.device
@@ -315,12 +239,8 @@ class Fantastic(nn.Module):
                 ssm_state.zero_()
         return conv_state, ssm_state
 
-    def get_auxiliary_loss(self):
-        return self.last_orthogonal_loss
 
-
-
-class FantasticBlock(nn.Module):
+class Fantastic_v0_Block(nn.Module):
     """Один блок: RMSNorm → Mamba → residual"""
     def __init__(
         self,
@@ -328,37 +248,42 @@ class FantasticBlock(nn.Module):
         num_experts=8,
         top_k=1,
         d_state=16,
-        d_conv=4,
-        expand=2,
         lb_strategy: str = "none",
         lb_coef: float = 0.01,
         aux_free_bias_step: float = 1e-3,
         dt_strategy: str = "random",
-        basis_mode: bool = False,
-        orthogonal_loss_coef: float = 0.0,
+        ff_mult: int = 2,
+        dropout: float = 0.0,
     ):
         super().__init__()
-        self.norm = RMSNorm(d_model)
-        self.fantastic = Fantastic(
+        self.norm1 = RMSNorm(d_model)
+        self.fantastic = Fantastic_v0(
             d_model=d_model,
             num_experts=num_experts,
             top_k=top_k,
             d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
             lb_strategy=lb_strategy,
             lb_coef=lb_coef,
             aux_free_bias_step=aux_free_bias_step,
             dt_strategy=dt_strategy,
-            basis_mode=basis_mode,
-            orthogonal_loss_coef=orthogonal_loss_coef,
         )
 
+        self.norm2 = nn.RMSNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_model * ff_mult),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * ff_mult, d_model),
+            nn.Dropout(dropout),
+        ) if ff_mult > 0 else nn.Identity()
+
     def forward(self, x):
-        return x + self.fantastic(self.norm(x))
+        x = x + self.fantastic(self.norm1(x))
+        x = x + self.ff(self.norm2(x))
+        return x
 
 
-class FantasticSSM(nn.Module):
+class Fantastic_v0_SSM(nn.Module):
     def __init__(
         self,
         vocab_size: int,
@@ -367,15 +292,13 @@ class FantasticSSM(nn.Module):
         num_experts: int = 8,
         top_k: int = 1,
         d_state: int = 16,
-        d_conv: int = 4,
-        expand: int = 2,
+        ff_mult: int = 2,
         lb_strategy: str = "none",
         lb_coef: float = 0.01,
         aux_free_bias_step: float = 1e-3,
         dt_strategy: str = "random",
         pad_vocab_size_multiple: int = 8,
-        basis_mode: bool = False,
-        orthogonal_loss_coef: float = 0.0,
+        dropout: float = 0.0,
     ):
         super().__init__()
 
@@ -386,19 +309,17 @@ class FantasticSSM(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
 
         self.layers = nn.ModuleList([
-            FantasticBlock(
+            Fantastic_v0_Block(
                 d_model,
                 num_experts,
                 top_k,
                 d_state,
-                d_conv,
-                expand,
                 lb_strategy,
                 lb_coef,
                 aux_free_bias_step,
-                dt_strategy=dt_strategy,
-                basis_mode=basis_mode,
-                orthogonal_loss_coef=orthogonal_loss_coef,
+                dt_strategy,
+                ff_mult,
+                dropout,
             ) for _ in range(n_layers)
         ])
 
@@ -412,7 +333,6 @@ class FantasticSSM(nn.Module):
 
     def _init_weights(self):
         nn.init.normal_(self.embedding.weight, std=0.02)
-        # Mamba инициализирует себя сама внутри
 
     def forward(self, input_ids):
         x = self.embedding(input_ids)      # (B, L, d_model)

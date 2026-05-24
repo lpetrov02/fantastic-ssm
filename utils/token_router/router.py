@@ -97,6 +97,7 @@ class TokenTopKRouter(nn.Module):
         lb_strategy: str = "none",
         lb_coef: float = 0.01,
         aux_free_bias_step: float = 1e-3,
+        basis_mode: bool = False,
     ):
         super().__init__()
         self.n_experts = n_experts
@@ -104,7 +105,8 @@ class TokenTopKRouter(nn.Module):
         self.lb_strategy = lb_strategy
         self.lb_coef = lb_coef
         self.aux_free_bias_step = aux_free_bias_step
-        self.proj = nn.Linear(d_model, n_experts)
+        self.basis_mode = basis_mode
+        self.proj = nn.Linear(d_model, n_experts + int(self.basis_mode))
 
         if lb_strategy == "aux_free":
             self.register_buffer("expert_bias", torch.zeros(n_experts))
@@ -126,6 +128,9 @@ class TokenTopKRouter(nn.Module):
           logits: (B, L, E)
         """
         logits = self.proj(u.transpose(1, 2))  # (B, L, E)
+        mult = torch.ones(logits.shape[:-1]).unsqueeze(-1)
+        if self.basis_mode:
+            logits, mult = logits[..., :-1], logits[..., -1].unsqueeze(-1)
 
         # aux_free: bias selection scores only; weights come from unbiased logits
         if self.lb_strategy == "aux_free":
@@ -194,7 +199,7 @@ class TokenTopKRouter(nn.Module):
             probs = F.softmax(logits.float(), dim=-1)  # (B, L, E)
             self.last_entropy = -(probs * torch.log(probs + 1e-9)).sum(-1).mean().item()
 
-        return alpha, logits
+        return alpha * mult, logits
 
     def get_auxiliary_loss(self):
         if self.lb_strategy == "lbl" and self.last_lb_loss is not None:
