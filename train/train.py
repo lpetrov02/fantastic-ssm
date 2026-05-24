@@ -71,7 +71,7 @@ def parse_args():
     p.add_argument("--aux_free_bias_step", type=float,   default=0.001,   help="Fantastic only")
     p.add_argument("--dt_strategy", type=str,   default="random",   help="Fantastic only")
     p.add_argument("--basis_mode", action="store_true", help="Fantastic_mode")
-    p.add_argument("--orthogonal_loss_coef", type="float", default=0.0, help="Fantastic only")
+    p.add_argument("--orthogonal_loss_coef", type=float, default=0.0, help="Fantastic only")
 
     p.add_argument("--dropout",       type=float,   default=0.0,   help="S4DLanguageModel only")
     p.add_argument("--ff_mult",       type=int,   default=2,   help="S4DLanguageModel only")

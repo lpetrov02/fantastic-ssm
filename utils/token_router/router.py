@@ -128,7 +128,7 @@ class TokenTopKRouter(nn.Module):
           logits: (B, L, E)
         """
         logits = self.proj(u.transpose(1, 2))  # (B, L, E)
-        mult = torch.ones(logits.shape[:-1]).unsqueeze(-1)
+        mult = torch.ones(logits.shape[:-1], device=logits.device).unsqueeze(-1)
         if self.basis_mode:
             logits, mult = logits[..., :-1], logits[..., -1].unsqueeze(-1)
 

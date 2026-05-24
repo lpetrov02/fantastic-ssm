@@ -76,15 +76,13 @@ class Fantastic_v0(nn.Module):
             log_dt = torch.rand(self.num_experts, self.d_inner) \
                 * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
         elif dt_strategy == "linspace":
-            dt_min = torch.linspace(dt_min, dt_max, self.num_experts + 1)[:-1, None]
-            dt_max = torch.linspace(dt_min, dt_max, self.num_experts + 1)[1:, None]
+            dts = torch.linspace(dt_min, dt_max, self.num_experts + 1)
             log_dt = torch.rand(self.num_experts, self.d_inner) \
-                * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+                * (torch.log(dts[1:, None]) - torch.log(dts[:-1, None])) + torch.log(dts[:-1, None])
         elif dt_strategy == "logspace":
-            dt_min = torch.logspace(dt_min, dt_max, self.num_experts + 1)[:-1, None]
-            dt_max = torch.logspace(dt_min, dt_max, self.num_experts + 1)[1:, None]
+            dts = torch.logspace(dt_min, dt_max, self.num_experts + 1)
             log_dt = torch.rand(self.num_experts, self.d_inner) \
-                * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+                * (torch.log(dts[1:, None]) - torch.log(dts[:-1, None])) + torch.log(dts[:-1, None])
         else:
             raise ValueError(f"Unknown dt strategy: {dt_strategy}")
         self.log_dt = nn.Parameter(log_dt)
@@ -106,6 +104,11 @@ class Fantastic_v0(nn.Module):
         self.C = nn.Parameter(C)
         self.D = nn.Parameter(torch.ones(self.d_inner, device=device))
         self.D._no_weight_decay = True
+
+        self.output_linear = nn.Sequential(
+            nn.Linear(self.d_inner, self.d_inner * 2),
+            nn.GLU(dim=-1),
+        )
 
     def forward(self,
         hidden_states,
@@ -162,6 +165,7 @@ class Fantastic_v0(nn.Module):
             y, last_state = y
             ssm_state.copy_(last_state)
         y = rearrange(y, "b d l -> b l d")
+        y = self.output_linear(y)
         return y
 
     def step(self, hidden_states, conv_state, ssm_state):
@@ -195,7 +199,8 @@ class Fantastic_v0(nn.Module):
             y = selective_state_update(
                 ssm_state, x, dt, A, B, C, self.D, z=None, dt_bias=self.dt_proj.bias, dt_softplus=True
             )
-
+        
+        y = self.output_linear(y)
         return y.unsqueeze(1), conv_state, ssm_state
     
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
