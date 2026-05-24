@@ -27,7 +27,7 @@ except ImportError:
 from utils.token_router.router import TokenTopKRouter
 
 
-class FantasticSSM(nn.Module):
+class Fantastic(nn.Module):
 
     def __init__(
         self,
@@ -46,6 +46,7 @@ class FantasticSSM(nn.Module):
         lb_strategy: str = "none",
         lb_coef: float = 0.01,
         aux_free_bias_step: float = 1e-3,
+        dt_strategy: str = "random",
         device = None,
         dtype = None,
         **kwargs
@@ -60,6 +61,7 @@ class FantasticSSM(nn.Module):
         self.layer_idx = layer_idx
         self.num_experts = num_experts
         self.top_k = top_k
+        self.dt_strategy = dt_strategy
 
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
@@ -88,8 +90,21 @@ class FantasticSSM(nn.Module):
         self.act = nn.SiLU()
 
         # DELTA
-        log_dt = torch.rand(self.num_experts, self.d_inner) \
-            * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+        if dt_strategy == "random":
+            log_dt = torch.rand(self.num_experts, self.d_inner) \
+                * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+        elif dt_strategy == "linspace":
+            dt_min = torch.linspace(dt_min, dt_max, self.num_experts + 1)[:-1, None]
+            dt_max = torch.linspace(dt_min, dt_max, self.num_experts + 1)[1:, None]
+            log_dt = torch.rand(self.num_experts, self.d_inner) \
+                * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+        elif dt_strategy == "logspace":
+            dt_min = torch.logspace(dt_min, dt_max, self.num_experts + 1)[:-1, None]
+            dt_max = torch.logspace(dt_min, dt_max, self.num_experts + 1)[1:, None]
+            log_dt = torch.rand(self.num_experts, self.d_inner) \
+                * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+        else:
+            raise ValueError(f"Unknown dt strategy: {dt_strategy}")
         self.log_dt = nn.Parameter(log_dt)
 
         # A-matrix
@@ -289,23 +304,38 @@ class FantasticSSM(nn.Module):
 
 class FantasticBlock(nn.Module):
     """Один блок: RMSNorm → Mamba → residual"""
-    def __init__(self, d_model, num_experts=8, top_k=1, d_state=16, d_conv=4, expand=2):
+    def __init__(
+        self,
+        d_model,
+        num_experts=8,
+        top_k=1,
+        d_state=16,
+        d_conv=4,
+        expand=2,
+        lb_strategy: str = "none",
+        lb_coef: float = 0.01,
+        aux_free_bias_step: float = 1e-3,
+        dt_strategy: str = "random",
+    ):
         super().__init__()
         self.norm = RMSNorm(d_model)
-        self.fantastic = FantasticSSM(
+        self.fantastic = Fantastic(
             d_model=d_model,
             num_experts=num_experts,
             top_k=top_k,
             d_state=d_state,
             d_conv=d_conv,
             expand=expand,
+            lb_strategy=lb_strategy,
+            lb_coef=lb_coef,
+            aux_free_bias_step=aux_free_bias_step,
         )
 
     def forward(self, x):
         return x + self.fantastic(self.norm(x))
 
 
-class FantasticSSM130M(nn.Module):
+class FantasticSSM(nn.Module):
     def __init__(
         self,
         vocab_size: int,
@@ -316,6 +346,10 @@ class FantasticSSM130M(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
+        lb_strategy: str = "none",
+        lb_coef: float = 0.01,
+        aux_free_bias_step: float = 1e-3,
+        dt_strategy: str = "random",
         pad_vocab_size_multiple: int = 8,
     ):
         super().__init__()
@@ -327,8 +361,17 @@ class FantasticSSM130M(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
 
         self.layers = nn.ModuleList([
-            FantasticBlock(d_model, num_experts, top_k, d_state, d_conv, expand)
-            for _ in range(n_layers)
+            FantasticBlock(
+                d_model,
+                num_experts,
+                top_k,
+                d_state,
+                d_conv,
+                expand,
+                lb_strategy,
+                lb_coef,
+                aux_free_bias_step,
+            ) for _ in range(n_layers)
         ])
 
         self.norm_f = RMSNorm(d_model)  # финальная нормализация

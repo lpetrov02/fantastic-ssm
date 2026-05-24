@@ -122,7 +122,7 @@ class S4DBlock(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(d_model * ff_mult, d_model),
             nn.Dropout(dropout),
-        )
+        ) if ff_mult > 0 else nn.Identity()
 
     def forward(self, x):
         out, _ = self.s4d(self.norm1(x).transpose(-1, -2))

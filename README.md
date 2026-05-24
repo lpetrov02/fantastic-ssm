@@ -3,7 +3,7 @@
 ## Training
 
 ```bash
-# Single node, 4 GPUs — FantasticSSM
+# Single node, 4 GPUs — Fantastic
 torchrun --standalone --nproc_per_node=4 train/train.py \
     --model fantastic \
     --data_dir ./data/train \

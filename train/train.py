@@ -1,5 +1,5 @@
 """
-DDP training script for Mamba130M / FantasticSSM130M.
+DDP training script for Mamba130M / FantasticSSM.
 
 Launch with torchrun:
     torchrun --standalone --nproc_per_node=NUM_GPUS train/train.py [args]
@@ -33,7 +33,7 @@ from torch.utils.tensorboard import SummaryWriter
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from models.mamba.mamba import Mamba130M
-from models.fantastic.fantastic_ssm import FantasticSSM130M
+from models.fantastic.fantastic_ssm import FantasticSSM
 from models.s4.s4d import S4DLanguageModel
 from train_data.data_loader import ShardedDataLoader, ValDataLoader
 
@@ -46,7 +46,7 @@ def ensure_dir(path):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train Mamba / FantasticSSM with DDP")
+    p = argparse.ArgumentParser(description="Train Mamba / Fantastic with DDP")
 
     # paths
     p.add_argument("--data_dir",       default="./data/train")
@@ -62,8 +62,14 @@ def parse_args():
     p.add_argument("--d_state",     type=int,   default=16)
     p.add_argument("--d_conv",      type=int,   default=4)
     p.add_argument("--expand",      type=int,   default=2)
-    p.add_argument("--num_experts", type=int,   default=8,   help="FantasticSSM only")
-    p.add_argument("--top_k",       type=int,   default=1,   help="FantasticSSM only")
+
+    p.add_argument("--num_experts",        type=int,   default=8,   help="Fantastic only")
+    p.add_argument("--top_k",              type=int,   default=1,   help="Fantastic only")
+    p.add_argument("--lb_strategy",        type=str, default="none", help="Fantastic only")
+    p.add_argument("--lb_coef",            type=float,   default=0.01,   help="Fantastic only")
+    p.add_argument("--aux_free_bias_step", type=float,   default=0.001,   help="Fantastic only")
+    p.add_argument("--dt_strategy", type=str,   default="random",   help="Fantastic only")
+
     p.add_argument("--dropout",       type=float,   default=0.0,   help="S4DLanguageModel only")
     p.add_argument("--ff_mult",       type=int,   default=2,   help="S4DLanguageModel only")
 
@@ -121,7 +127,7 @@ def build_model(args) -> nn.Module:
             expand=args.expand,
         )
     elif args.model == "fantastic":
-        return FantasticSSM130M(
+        return FantasticSSM(
             vocab_size=args.vocab_size,
             d_model=args.d_model,
             n_layers=args.n_layers,
@@ -130,6 +136,10 @@ def build_model(args) -> nn.Module:
             d_state=args.d_state,
             d_conv=args.d_conv,
             expand=args.expand,
+            lb_strategy=args.lb_strategy,
+            lb_coef=args.lb_coef,
+            aux_free_bias_step=args.aux_free_bias_step,
+            dt_strategy=args.dt_strategy,
         )
     elif args.model == "s4d":
         return S4DLanguageModel(
@@ -177,7 +187,7 @@ def get_lr(step: int, args) -> float:
     return args.min_lr + 0.5 * (args.lr - args.min_lr) * (1.0 + math.cos(math.pi * progress))
 
 
-# ── Auxiliary loss (FantasticSSM routers) ────────────────────────────────────
+# ── Auxiliary loss (Fantastic routers) ────────────────────────────────────
 
 def collect_aux_loss(raw_model: nn.Module):
     total = None
