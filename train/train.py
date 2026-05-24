@@ -93,6 +93,12 @@ def parse_args():
     p.add_argument("--save_every", type=int, default=1000)
     p.add_argument("--keep_ckpts", type=int, default=3, help="how many checkpoints to keep")
 
+    # embeddings
+    p.add_argument("--use_pretrained", action="store_true", default=False,
+                   help="Init embedding layer from GPT-2 weights (requires matching vocab_size and d_model)")
+    p.add_argument("--freeze_embeds", action="store_true", default=False,
+                   help="Freeze embedding weights (only effective with --use_pretrained)")
+
     # resume
     p.add_argument("--resume", default=None, help="path to checkpoint to resume from")
 
@@ -172,6 +178,37 @@ def build_model(args) -> nn.Module:
         )
     else:
         raise ValueError("Invalid model type")
+
+
+# ── Pretrained embeddings ─────────────────────────────────────────────────────
+
+def apply_pretrained_embeddings(model: nn.Module, args, is_main: bool):
+    if not args.use_pretrained:
+        return
+    try:
+        from transformers import GPT2Model
+    except ImportError:
+        raise ImportError("transformers package is required for --use_pretrained")
+
+    gpt2 = GPT2Model.from_pretrained("gpt2")
+    gpt2_emb = gpt2.wte.weight.data  # (50257, 768)
+
+    if gpt2_emb.shape != (args.vocab_size, args.d_model):
+        raise ValueError(
+            f"GPT-2 embedding shape {tuple(gpt2_emb.shape)} does not match "
+            f"vocab_size={args.vocab_size}, d_model={args.d_model}"
+        )
+
+    with torch.no_grad():
+        model.embedding.weight.copy_(gpt2_emb)
+
+    if args.freeze_embeds:
+        model.embedding.weight.requires_grad_(False)
+        if is_main:
+            print("Embeddings loaded from GPT-2 and frozen.")
+    else:
+        if is_main:
+            print("Embeddings loaded from GPT-2 (trainable).")
 
 
 # ── Optimizer ─────────────────────────────────────────────────────────────────
@@ -284,6 +321,7 @@ def main():
 
     # ── Model + DDP ───────────────────────────────────────────────────
     raw_model = build_model(args).to(device)
+    apply_pretrained_embeddings(raw_model, args, is_main)
     model = DDP(raw_model, device_ids=[local_rank])
     if is_main:
         n_params = sum(p.numel() for p in raw_model.parameters())
