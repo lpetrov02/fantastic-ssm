@@ -8,6 +8,11 @@ import torch.nn.functional as F
 from einops import rearrange
 
 try:
+    from mamba_ssm.ops.triton.layer_norm import RMSNorm
+except ImportError:
+    RMSNorm = nn.LayerNorm
+
+try:
     from flash_attn import flash_attn_with_kvcache
 except ImportError:
     flash_attn_with_kvcache = None
@@ -292,3 +297,80 @@ class MHA(nn.Module):
             context = torch.cat([context, x_mlp], dim=-1)
         out = self.out_proj(context)
         return out
+
+
+# ── Transformer language model ─────────────────────────────────────────────────
+
+class TransformerBlock(nn.Module):
+    """Pre-norm Transformer block: RMSNorm → MHA → residual + RMSNorm → FFN → residual."""
+
+    def __init__(self, d_model: int, num_heads: int, ffn_mult: int = 4, layer_idx: int = None):
+        super().__init__()
+        self.norm1 = RMSNorm(d_model)
+        self.attn = MHA(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            causal=True,
+            layer_idx=layer_idx,
+        )
+        self.norm2 = RMSNorm(d_model)
+        ffn_dim = d_model * ffn_mult
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, ffn_dim, bias=False),
+            nn.GELU(),
+            nn.Linear(ffn_dim, d_model, bias=False),
+        )
+
+    def forward(self, x, inference_params=None):
+        x = x + self.attn(self.norm1(x), inference_params=inference_params)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class Transformer130M(nn.Module):
+    """
+    Decoder-only Transformer, ~124 M parameters with default settings.
+
+    Default configuration matches the 130 M Transformer baseline from the
+    Mamba paper (d_model=768, n_layers=12, num_heads=12, ffn_mult=4).
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 768,
+        n_layers: int = 12,
+        num_heads: int = 12,
+        ffn_mult: int = 4,
+        pad_vocab_size_multiple: int = 8,
+    ):
+        super().__init__()
+
+        if vocab_size % pad_vocab_size_multiple != 0:
+            vocab_size += pad_vocab_size_multiple - (vocab_size % pad_vocab_size_multiple)
+
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model, num_heads, ffn_mult, layer_idx=i)
+            for i in range(n_layers)
+        ])
+        self.norm_f = RMSNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head.weight = self.embedding.weight  # weight tying
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.embedding.weight, std=0.02)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, input_ids, inference_params=None):
+        x = self.embedding(input_ids)          # (B, L, d_model)
+        for layer in self.layers:
+            x = layer(x, inference_params=inference_params)
+        x = self.norm_f(x)
+        return self.lm_head(x)                 # (B, L, vocab_size)

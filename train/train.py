@@ -37,6 +37,7 @@ from models.fantastic.fantastic_ssm import FantasticSSM
 from models.fantastic.fantastic_v0 import Fantastic_v0_SSM
 from models.fantastic.fantastic_v2 import Fantastic_v2_SSM
 from models.s4.s4d import S4DLanguageModel
+from models.attention.mha import Transformer130M
 from train_data.data_loader import ShardedDataLoader, ValDataLoader
 
 
@@ -56,7 +57,7 @@ def parse_args():
     p.add_argument("--checkpoint_dir", default="./experiments/checkpoints")
 
     # model
-    p.add_argument("--model",       choices=["mamba", "fantastic", "fantastic_v0", "fantastic_v2", "s4d"], default="mamba")
+    p.add_argument("--model",       choices=["mamba", "fantastic", "fantastic_v0", "fantastic_v2", "s4d", "transformer"], default="mamba")
     p.add_argument("--model_name",  type=str)
     p.add_argument("--vocab_size",  type=int,   default=50257)
     p.add_argument("--d_model",     type=int,   default=768)
@@ -80,7 +81,8 @@ def parse_args():
     p.add_argument("--dt_top_k",              type=str,   default="auto",   help="Fantastic-v2 only")    
 
     p.add_argument("--dropout",       type=float,   default=0.0,   help="S4DLanguageModel only")
-    p.add_argument("--ff_mult",       type=int,   default=2,   help="S4DLanguageModel only")
+    p.add_argument("--ff_mult",       type=int,   default=2,   help="FFN multiplier (S4DLanguageModel default=2; use 4 for transformer)")
+    p.add_argument("--num_heads",     type=int,   default=12,  help="Number of attention heads (transformer only)")
 
     # training
     p.add_argument("--seq_len",          type=int,   default=2048)
@@ -202,6 +204,14 @@ def build_model(args) -> nn.Module:
             d_state=args.d_state,
             ff_mult=args.ff_mult,
             dropout=args.dropout,
+        )
+    elif args.model == "transformer":
+        return Transformer130M(
+            vocab_size=args.vocab_size,
+            d_model=args.d_model,
+            n_layers=args.n_layers,
+            num_heads=args.num_heads,
+            ffn_mult=args.ff_mult,
         )
     else:
         raise ValueError("Invalid model type")
