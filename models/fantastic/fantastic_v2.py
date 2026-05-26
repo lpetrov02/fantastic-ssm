@@ -27,7 +27,7 @@ except ImportError:
 from utils.token_router.router import TokenTopKRouter
 
 
-class Fantastic(nn.Module):
+class Fantastic_v2(nn.Module):
 
     def __init__(
         self,
@@ -49,7 +49,9 @@ class Fantastic(nn.Module):
         dt_strategy: str = "random",
         basis_mode: bool = False,
         orthogonal_loss_coef: float = 0.0,
-        separate_routing: bool = False,
+        dt_rank: int|str = "auto",
+        dt_num_experts: int|str = "auto",
+        dt_top_k: int|str = "auto",
         device = None,
         dtype = None,
         **kwargs
@@ -69,10 +71,14 @@ class Fantastic(nn.Module):
         self.basis_mode = basis_mode
         self.orthogonal_loss_coef = orthogonal_loss_coef
         self.last_orthogonal_loss = None
-        self.separate_routing = separate_routing
+        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else int(dt_rank)
+
+        self.dt_num_experts = self.dt_rank if dt_num_experts == "auto" else int(dt_num_experts)
+        self.dt_top_k = self.dt_rank if dt_top_k == "auto" else int(dt_top_k)
 
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=bias, **factory_kwargs)
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
         self.d_conv = d_conv
@@ -86,24 +92,16 @@ class Fantastic(nn.Module):
             **factory_kwargs,
         ) if d_conv > 0 else nn.Identity()
 
-        self.router = TokenTopKRouter(
-            self.d_inner,
-            self.num_experts,
-            self.top_k,
-            lb_strategy,
-            lb_coef,
-            aux_free_bias_step,
-            basis_mode,
-        ) if not self.separate_routing else nn.ModuleList([
+        self.router = nn.ModuleList([
             TokenTopKRouter(
                 self.d_inner,
-                self.num_experts,
-                self.top_k,
+                self.dt_num_experts if i == 0 else self.num_experts,
+                self.dt_top_k if i == 0 else self.top_k,
                 lb_strategy,
                 lb_coef,
                 aux_free_bias_step,
                 basis_mode,
-            ) for _ in range(3)
+            ) for i in range(3)
         ])
 
         self.activation = "silu"
@@ -111,19 +109,19 @@ class Fantastic(nn.Module):
 
         # DELTA
         if dt_strategy == "random":
-            log_dt = torch.rand(self.num_experts, self.d_inner) \
-                * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+            dt = torch.rand(self.dt_num_experts, self.dt_rank) \
+                * (dt_max - dt_min) + dt_min
         elif dt_strategy == "linspace":
             dts = torch.linspace(dt_min, dt_max, self.num_experts + 1)
-            log_dt = torch.rand(self.num_experts, self.d_inner) \
-                * (torch.log(dts[1:, None]) - torch.log(dts[:-1, None])) + torch.log(dts[:-1, None])
+            dt = torch.rand(self.dt_num_experts, self.dt_rank) \
+                * (dts[1:, None] - dts[:-1, None]) + dts[:-1, None]
         elif dt_strategy == "logspace":
             dts = torch.logspace(dt_min, dt_max, self.num_experts + 1)
-            log_dt = torch.rand(self.num_experts, self.d_inner) \
-                * (torch.log(dts[1:, None]) - torch.log(dts[:-1, None])) + torch.log(dts[:-1, None])
+            dt = torch.rand(self.dt_num_experts, self.dt_rank) \
+                * (dts[1:, None] - dts[:-1, None]) + dts[:-1, None]
         else:
             raise ValueError(f"Unknown dt strategy: {dt_strategy}")
-        self.log_dt = nn.Parameter(log_dt)
+        self.dt = nn.Parameter(dt)
 
         # A-matrix
         A = repeat(
@@ -158,9 +156,9 @@ class Fantastic(nn.Module):
 
         if self.training and self.orthogonal_loss_coef > 0:
             self.last_orthogonal_loss = 0.0
-            params = (self.log_dt, self.B, self.C)
+            params = (self.dt, self.B, self.C)
             for param in params:
-                W = F.normalize(param, dim=1)
+                W = param if self.basis_mode else F.normalize(param, dim=1)
                 self.last_orthogonal_loss += (W @ W.T - torch.eye(W.size(0), device=W.device)).pow(2).sum()
             self.last_orthogonal_loss *= self.orthogonal_loss_coef
 
@@ -201,27 +199,17 @@ class Fantastic(nn.Module):
                     seq_idx=None,
                 )
 
-        if self.separate_routing:
-            alpha_b, alpha_c, alpha_dt = [
-                router(
-                    x,
-                    noise_scale=noise_scale,
-                    mixture_temperature=mixture_temperature,
-                    straight_through=straight_through,
-                    uniform_topk_eps=uniform_topk_eps,
-                )[0] for router in self.router
-            ]
-        else:
-            alpha, _ = self.router(
+        alpha_dt, alpha_b, alpha_c = [
+            router(
                 x,
                 noise_scale=noise_scale,
                 mixture_temperature=mixture_temperature,
                 straight_through=straight_through,
                 uniform_topk_eps=uniform_topk_eps,
-            )  # alpha: (B, L, E)
-            alpha_b, alpha_c, alpha_dt = alpha, alpha, alpha
+            )[0] for router in self.router
+        ]
 
-        dt = (alpha_dt @ torch.exp(self.log_dt)).transpose(-1, -2)
+        dt = self.dt_proj(alpha_dt @ self.dt).transpose(-1, -2)
         B = (alpha_b @ self.B).transpose(-1, -2)  # (B, N, L)
         C = (alpha_c @ self.C).transpose(-1, -2)  # (B, N, L)
 
@@ -268,27 +256,17 @@ class Fantastic(nn.Module):
                     self.activation,
                 )
 
-        if self.separate_routing:
-            alpha_b, alpha_c, alpha_dt = [
-                router(
-                    x,
-                    noise_scale=0,
-                    mixture_temperature=1.0,
-                    straight_through=True,
-                    uniform_topk_eps=0,
-                )[0] for router in self.router
-            ]
-        else:
-            alpha, _ = self.router(
+        alpha_dt, alpha_b, alpha_c = [
+            router(
                 x,
                 noise_scale=0,
                 mixture_temperature=1.0,
                 straight_through=True,
                 uniform_topk_eps=0,
-            )  # alpha: (B, L, E)
-            alpha_b, alpha_c, alpha_dt = alpha, alpha, alpha
+            )[0] for router in self.router
+        ]
 
-        dt = alpha_dt @ torch.exp(self.log_dt)
+        dt = self.dt_proj(alpha_dt @ self.log_dt)
         A = -torch.exp(self.A_log.float())
         B = (alpha_b @ self.B)  # (B, N)
         C = (alpha_c @ self.C)  # (B, N)
@@ -357,7 +335,7 @@ class Fantastic(nn.Module):
 
 
 
-class FantasticBlock(nn.Module):
+class Fantastic_v2_Block(nn.Module):
     """Один блок: RMSNorm → Mamba → residual"""
     def __init__(
         self,
@@ -373,11 +351,13 @@ class FantasticBlock(nn.Module):
         dt_strategy: str = "random",
         basis_mode: bool = False,
         orthogonal_loss_coef: float = 0.0,
-        separate_routing: bool = False,
+        dt_rank: int|str = "auto",
+        dt_num_experts: int|str = "auto",
+        dt_top_k: int|str = "auto",
     ):
         super().__init__()
         self.norm = RMSNorm(d_model)
-        self.fantastic = Fantastic(
+        self.fantastic = Fantastic_v2(
             d_model=d_model,
             num_experts=num_experts,
             top_k=top_k,
@@ -390,14 +370,16 @@ class FantasticBlock(nn.Module):
             dt_strategy=dt_strategy,
             basis_mode=basis_mode,
             orthogonal_loss_coef=orthogonal_loss_coef,
-            separate_routing=separate_routing,
+            dt_rank=dt_rank,
+            dt_num_experts=dt_num_experts,
+            dt_top_k=dt_top_k,
         )
 
     def forward(self, x):
         return x + self.fantastic(self.norm(x))
 
 
-class FantasticSSM(nn.Module):
+class Fantastic_v2_SSM(nn.Module):
     def __init__(
         self,
         vocab_size: int,
@@ -415,7 +397,9 @@ class FantasticSSM(nn.Module):
         pad_vocab_size_multiple: int = 8,
         basis_mode: bool = False,
         orthogonal_loss_coef: float = 0.0,
-        separate_routing: bool = False,
+        dt_rank: int|str = "auto",
+        dt_num_experts: int|str = "auto",
+        dt_top_k: int|str = "auto",
     ):
         super().__init__()
 
@@ -426,7 +410,7 @@ class FantasticSSM(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
 
         self.layers = nn.ModuleList([
-            FantasticBlock(
+            Fantastic_v2_Block(
                 d_model,
                 num_experts,
                 top_k,
@@ -439,7 +423,9 @@ class FantasticSSM(nn.Module):
                 dt_strategy=dt_strategy,
                 basis_mode=basis_mode,
                 orthogonal_loss_coef=orthogonal_loss_coef,
-                separate_routing=separate_routing,
+                dt_rank=dt_rank,
+                dt_num_experts=dt_num_experts,
+                dt_top_k=dt_top_k,
             ) for _ in range(n_layers)
         ])
 

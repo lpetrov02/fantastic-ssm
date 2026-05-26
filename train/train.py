@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from models.mamba.mamba import Mamba130M
 from models.fantastic.fantastic_ssm import FantasticSSM
 from models.fantastic.fantastic_v0 import Fantastic_v0_SSM
+from models.fantastic.fantastic_v2 import Fantastic_v2_SSM
 from models.s4.s4d import S4DLanguageModel
 from train_data.data_loader import ShardedDataLoader, ValDataLoader
 
@@ -55,7 +56,7 @@ def parse_args():
     p.add_argument("--checkpoint_dir", default="./experiments/checkpoints")
 
     # model
-    p.add_argument("--model",       choices=["mamba", "fantastic", "fantastic_v0", "s4d"], default="mamba")
+    p.add_argument("--model",       choices=["mamba", "fantastic", "fantastic_v0", "fantastic_v2", "s4d"], default="mamba")
     p.add_argument("--model_name",  type=str)
     p.add_argument("--vocab_size",  type=int,   default=50257)
     p.add_argument("--d_model",     type=int,   default=768)
@@ -72,6 +73,11 @@ def parse_args():
     p.add_argument("--dt_strategy", type=str,   default="random",   help="Fantastic only")
     p.add_argument("--basis_mode", action="store_true", help="Fantastic_mode")
     p.add_argument("--orthogonal_loss_coef", type=float, default=0.0, help="Fantastic only")
+    p.add_argument("--separate_routing", action="store_true", help="Fantastic_mode")
+
+    p.add_argument("--dt_rank",        type=str,   default="auto",   help="Fantastic-v2 only")
+    p.add_argument("--dt_num_experts",        type=str,   default="auto",   help="Fantastic-v2 only")
+    p.add_argument("--dt_top_k",              type=str,   default="auto",   help="Fantastic-v2 only")    
 
     p.add_argument("--dropout",       type=float,   default=0.0,   help="S4DLanguageModel only")
     p.add_argument("--ff_mult",       type=int,   default=2,   help="S4DLanguageModel only")
@@ -151,6 +157,27 @@ def build_model(args) -> nn.Module:
             dt_strategy=args.dt_strategy,
             basis_mode=args.basis_mode,
             orthogonal_loss_coef=args.orthogonal_loss_coef,
+            separate_routing=args.separate_routing,
+        )
+    elif args.model == "fantastic_v2":
+        return Fantastic_v2_SSM(
+            vocab_size=args.vocab_size,
+            d_model=args.d_model,
+            n_layers=args.n_layers,
+            num_experts=args.num_experts,
+            top_k=args.top_k,
+            d_state=args.d_state,
+            d_conv=args.d_conv,
+            expand=args.expand,
+            lb_strategy=args.lb_strategy,
+            lb_coef=args.lb_coef,
+            aux_free_bias_step=args.aux_free_bias_step,
+            dt_strategy=args.dt_strategy,
+            basis_mode=args.basis_mode,
+            orthogonal_loss_coef=args.orthogonal_loss_coef,
+            dt_rank=args.dt_rank,
+            dt_num_experts=args.dt_num_experts,
+            dt_top_k=args.dt_top_k,
         )
     elif args.model == "fantastic_v0":
         return Fantastic_v0_SSM(
