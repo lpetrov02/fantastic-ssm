@@ -6,3 +6,5 @@ train_data/data/*
 
 *checkpoints*
 *tensorboard_logs*
+
+evaluation/evaluation*

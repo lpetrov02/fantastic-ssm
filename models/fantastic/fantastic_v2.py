@@ -143,7 +143,7 @@ class Fantastic_v2(nn.Module):
 
     def forward(self,
         hidden_states,
-        noise_scale: float = 1.0,
+        noise_scale: float = 0.0,
         mixture_temperature: float = 1.0,
         straight_through: bool = True,
         uniform_topk_eps: float = 0.0,
@@ -400,6 +400,7 @@ class Fantastic_v2_SSM(nn.Module):
         dt_rank: int|str = "auto",
         dt_num_experts: int|str = "auto",
         dt_top_k: int|str = "auto",
+        **kwargs,
     ):
         super().__init__()
 

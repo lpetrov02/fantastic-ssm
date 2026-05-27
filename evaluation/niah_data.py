@@ -48,6 +48,7 @@ class NIAHSample:
 
 def _random_passkey() -> str:
     return str(random.randint(10000, 99999))
+    # return "".join([str(random.randint(0, 9)) for _ in range(30)])
 
 
 def _build_haystack(tokenizer, n_tokens: int, rng: random.Random) -> List[int]:
@@ -74,7 +75,8 @@ def build_sample(
     rng = random.Random(seed)
 
     if passkey is None:
-        passkey = str(rng.randint(10000, 99999))
+        # passkey = str(rng.randint(10000, 99999))
+        passkey = "".join([str(random.randint(0, 9)) for _ in range(30)])
 
     needle_ids = tokenizer.encode(NEEDLE_TEMPLATE.format(passkey=passkey))
     query_ids = tokenizer.encode(QUERY_PREFIX)
@@ -99,6 +101,8 @@ def build_sample(
 
     full_ids = context_ids + answer_ids
     answer_start = len(context_ids)
+
+    # print(tokenizer.decode(full_ids))
 
     return NIAHSample(
         input_ids=full_ids,

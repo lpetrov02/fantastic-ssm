@@ -35,6 +35,7 @@ from transformers import GPT2Tokenizer
 from models.mamba.mamba import Mamba130M
 from models.fantastic.fantastic_ssm import FantasticSSM
 from models.fantastic.fantastic_v0 import Fantastic_v0_SSM
+from models.fantastic.fantastic_v2 import Fantastic_v2_SSM
 from models.s4.s4d import S4DLanguageModel
 
 from evaluation.niah_data import build_grid, NIAHSample
@@ -55,7 +56,7 @@ def build_model(args: dict):
     if model_type == "mamba":
         return Mamba130M(**common)
 
-    if model_type in ("fantastic", "fantastic_v0"):
+    if model_type in ("fantastic", "fantastic_v0", "fantastic_v2"):
         fantastic_kwargs = dict(
             **common,
             d_state=args.get("d_state", 16),
@@ -68,8 +69,12 @@ def build_model(args: dict):
             orthogonal_loss_coef=args.get("orthogonal_loss_coef", 0.0),
             lb_strategy=args.get("lb_strategy", "none"),
             lb_coef=args.get("lb_coef", 0.01),
+            separate_routing=args.get("separate_routing", False),
+            dt_rank=args.get("dt_rank", "auto"),
+            dt_num_experts=args.get("dt_num_experts", "auto"),
+            dt_top_k=args.get("dt_top_k", "auto"),
         )
-        cls = FantasticSSM if model_type == "fantastic" else Fantastic_v0_SSM
+        cls = FantasticSSM if model_type == "fantastic" else (Fantastic_v2_SSM if model_type == "fantastic_v2" else Fantastic_v0_SSM)
         return cls(**fantastic_kwargs)
 
     if model_type == "s4d":
@@ -86,12 +91,16 @@ def build_model(args: dict):
 def load_checkpoint(path: str, device: torch.device):
     ckpt = torch.load(path, map_location=device)
     saved_args = ckpt.get("args", {})
+    print("Model ARGS:")
+    print(saved_args)
     model = build_model(saved_args)
     # Strip DDP wrapper prefix if present
     state = {k.replace("module.", ""): v for k, v in ckpt["model"].items()}
+    # print(state.keys())
     model.load_state_dict(state, strict=True)
     model.to(device)
     model.eval()
+    # model.train()
     print(
         f"Loaded {saved_args.get('model', '?')} checkpoint "
         f"(step {ckpt.get('step', '?')}) from {path}"
@@ -123,6 +132,7 @@ def eval_batch(model, samples: List[NIAHSample], device: torch.device) -> List[f
         # Predict positions [answer_start .. answer_end-1] from context tokens
         pred_logits = logits[i, s.answer_start - 1 : s.answer_end - 1]   # (A, V)
         targets = input_ids[i, s.answer_start : s.answer_end]             # (A,)
+        # print(F.cross_entropy(pred_logits, targets, reduction="none"))
         loss = F.cross_entropy(pred_logits, targets).item()
         losses.append(loss)
 

@@ -145,7 +145,7 @@ class Fantastic(nn.Module):
 
     def forward(self,
         hidden_states,
-        noise_scale: float = 1.0,
+        noise_scale: float = 0.0,
         mixture_temperature: float = 1.0,
         straight_through: bool = True,
         uniform_topk_eps: float = 0.0,
