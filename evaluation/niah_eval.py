@@ -99,8 +99,8 @@ def load_checkpoint(path: str, device: torch.device):
     # print(state.keys())
     model.load_state_dict(state, strict=True)
     model.to(device)
-    model.eval()
-    # model.train()
+    # model.eval()
+    model.train()
     print(
         f"Loaded {saved_args.get('model', '?')} checkpoint "
         f"(step {ckpt.get('step', '?')}) from {path}"

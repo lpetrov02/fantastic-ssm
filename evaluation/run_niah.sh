@@ -4,7 +4,7 @@
 set -euo pipefail
 
 # CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/mamba-130m/step_0020000.pt"
-CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/fantastic-v2-130m-e16a16-dt_full-orth001/step_0029000.pt"
+CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/fantastic-130m-e16a16-orth001-pretrained/step_0023000.pt"
 OUT_DIR="evaluation/results"
 DEVICE="cuda"
 

@@ -208,3 +208,89 @@ class TokenTopKRouter(nn.Module):
 
     def get_entropy(self) -> float | None:
         return getattr(self, "last_entropy", None)
+
+
+class AttentiveRouter(nn.Module):
+    """
+    Token-level router.
+    Input:  u of shape (B, H, L)
+    Output: alpha/logits of shape (B, L, E)
+
+    lb_strategy: "none" | "lbl" | "aux_free"
+      - "lbl":      adds Switch-Transformer-style load-balanced auxiliary loss
+      - "aux_free": updates a per-expert bias buffer to steer routing without
+                    any gradient-based loss term
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_parameter: int,
+        d_intermediate: int,
+        top_k: int,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.d_parameter = d_parameter
+        self.d_intermediate = d_intermediate
+
+        self.top_k = top_k
+
+        self.WK = nn.Linear(d_parameter, d_intermediate)
+        self.scale = d_intermediate ** -0.5
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        experts: torch.Tensor,
+        mult: torch.Tensor = None,
+        straight_through: bool = True,
+        mixture_temperature: float = 1.0,
+        uniform_topk_eps: float = 0.0,
+    ):
+        """
+        query: (B, L, D)
+        experts: (E, D0)
+        mult: (B, L)
+        returns:
+          alpha:  (B, L, E) sparse convex weights
+          logits: (B, L, E)
+        """
+        if mult is None:
+            mult = torch.ones(query.shape[:-1], device=query.device)
+        mult = mult.unsqueeze(-1)
+
+        keys = self.WK(experts)  # (E, D)
+        logits = (query @ keys.transpose(-2, -1)) * self.scale  # (B, L, E)
+
+        k = min(self.top_k, experts.shape[0])
+        _, top_idx = logits.topk(k, dim=-1)  # (B, L, K)
+
+        # Mixture weights computed from unbiased logits
+        selected_logits = logits.gather(-1, top_idx)  # (B, L, K)
+
+        tau = max(float(mixture_temperature), 1e-4)
+        top_alpha = F.softmax(selected_logits / tau, dim=-1)  # (B, L, K)
+
+        # Optional anti-collapse smoothing within top-k
+        if uniform_topk_eps > 0.0:
+            top_alpha = (1.0 - uniform_topk_eps) * top_alpha + uniform_topk_eps / k
+
+        hard = torch.zeros_like(logits).scatter_(-1, top_idx, top_alpha)  # (B, L, E)
+
+        if straight_through:
+            # Dense surrogate gradient, sparse forward — always from unbiased logits
+            soft_full = F.softmax(logits / tau, dim=-1)
+            alpha = hard + soft_full - soft_full.detach()
+        else:
+            alpha = hard            
+
+        with torch.no_grad():
+            probs = F.softmax(logits.float(), dim=-1)  # (B, L, E)
+            self.last_entropy = -(probs * torch.log(probs + 1e-9)).sum(-1).mean().item()
+
+        output = (alpha * mult) @ experts
+        return output, logits
+
+    def get_entropy(self) -> float | None:
+        return getattr(self, "last_entropy", None)

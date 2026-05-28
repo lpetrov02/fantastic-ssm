@@ -1,217 +1,442 @@
+# Copyright (c) 2023, Albert Gu, Tri Dao.
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from typing import Optional
-from einops import repeat, rearrange
+from einops import rearrange, repeat
+from pydantic import validate_call
 
 
-class LowRankMultiheadAttention(nn.Module):
-    def __init__(self, embed_dim, low_rank_dim, vdim=None):
-        super().__init__()
-        self.low_rank_dim = low_rank_dim  # 16 total, so 2-dim per head with 8 heads
-        self.vdim = vdim or embed_dim
+from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
+from mamba_ssm import Mamba
 
-        # Q and K project DOWN to low-rank space
-        self.q_proj = nn.Linear(embed_dim, low_rank_dim)
-        self.k_proj = nn.Linear(embed_dim, low_rank_dim)
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
 
-        self.scale = self.low_rank_dim ** -0.5
+try:
+    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+except ImportError:
+    causal_conv1d_fn, causal_conv1d_update = None, None
 
-    def forward(self, q, k, v, attn_mask=None, key_padding_mask=None):
-        B, T, _ = q.shape
-        S = k.shape[1]
+try:
+    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+except ImportError:
+    selective_state_update = None
 
-        Q = self.q_proj(q)
-        K = self.k_proj(k)
-
-        # Scaled dot-product attention
-        attn = (Q @ K.transpose(-2, -1)) * self.scale  # (B, heads, T, S)
-
-        if attn_mask is not None:
-            attn = attn + attn_mask
-        if key_padding_mask is not None:
-            attn = attn.masked_fill(key_padding_mask[:, None, None, :], float('-inf'))
-
-        attn = attn.softmax(dim=-1)
-        return attn @ v
+from utils.token_router.router import AttentiveRouter
 
 
-class S4DMoEAttn(nn.Module):
-    """
-    MoE-style S4D: tokens are routed to top-k experts; only chosen experts
-    receive the token as input (masked-input approach).  Each expert is a
-    full S4D model with d_inner channels.
-
-    Training: FFT convolution over all E×H expert-channel pairs at once,
-    then weight outputs by routing scores and sum across experts.
-    """
+class FantasticAttentive(nn.Module):
 
     def __init__(
         self,
-        d_model: int,
-        d_state: int = 64,
+        d_model,
+        d_intermediate: int|str = "auto",
+        d_state: int = 16,
+        d_conv:int = 4,
         expand: int = 2,
-        num_experts: int = 4,
         dropout: float = 0.0,
-        dt_min: float = 1e-4,
-        dt_max: float = 1e-1,
-        layer_idx=None,
-        learnable_A_imag: bool = True,
-        attn_dim=16,
-        **kwargs,
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        conv_bias: bool = True,
+        bias: bool = False,
+        layer_idx = None,
+        basis_mode: bool = False,
+        orthogonal_loss_coef_state: float = 0.0,
+        orthogonal_loss_coef_dt: float = 0.0,
+        state_num_experts: int|str = "auto",
+        state_top_k: int|str = "auto",
+        dt_num_experts: int|str = "auto",
+        dt_top_k: int|str = "auto",
+        device = None,
+        dtype = None,
+        **kwargs
     ):
         super().__init__()
-        assert d_state % 2 == 0, "d_state must be even for complex conjugate pairs"
+        factory_kwargs = {"device": device, "dtype": dtype}
         self.d_model = d_model
         self.d_state = d_state
-        self.d_inner = expand * d_model
-        self.n2 = d_state // 2  # complex conjugate pairs per channel
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(self.expand * self.d_model)
         self.layer_idx = layer_idx
-        self.num_experts = num_experts
+        self.state_num_experts = state_num_experts
+        self.state_top_k = state_top_k
 
-        H, N2, E = self.d_inner, self.n2, num_experts
+        self.basis_mode = basis_mode
+        self.orthogonal_loss_coef_state = orthogonal_loss_coef_state
+        self.orthogonal_loss_coef_dt = orthogonal_loss_coef_dt
+        self.last_orthogonal_loss = None
+        self.d_intermediate = math.ceil(self.d_model / 16) if d_intermediate == "auto" else int(d_intermediate)
 
-        self.router = LowRankMultiheadAttention(
-            H,
-            low_rank_dim=attn_dim,
-        )
+        self.dt_num_experts = math.ceil(self.d_model / 16) if dt_num_experts == "auto" else int(dt_num_experts)
+        self.dt_top_k = self.dt_num_experts if dt_top_k == "auto" else int(self.dt_top_k)
+        self.state_num_experts = self.d_state if state_num_experts == "auto" else int(state_num_experts)
+        self.state_top_k = self.state_num_experts if state_top_k == "auto" else int(self.state_top_k)
 
-        # Input expands to (x, z) like Mamba; z serves as the GLU gate
-        self.in_proj = nn.Linear(d_model, 2 * H, bias=False)
-        self.out_proj = nn.Linear(H, d_model, bias=False)
-
-        # SSM parameters: (E, H, ...) — one independent set per expert
-        log_dt = torch.rand(E * H) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
-        self.log_dt = nn.Parameter(log_dt)                           # (E*H)
-
-        log_A_real = torch.log(0.5 * torch.ones(E * H, N2))
-        self.log_A_real = nn.Parameter(log_A_real)                   # (E*H, N2)
-
-        A_imag = math.pi * repeat(torch.arange(N2, dtype=torch.float32), "n -> h n", h=E*H)
-        if learnable_A_imag:
-            self.A_imag = nn.Parameter(A_imag)                       # (E*H, N2)
-        else:
-            self.register_buffer("A_imag", A_imag)
-
-        B = torch.ones(E * H, N2, dtype=torch.cfloat)
-        self.B = nn.Parameter(torch.view_as_real(B))                 # (E*H, N2, 2)
-
-        C = torch.randn(E * H, N2, dtype=torch.cfloat)
-        self.C = nn.Parameter(torch.view_as_real(C))                 # (E*H, N2, 2)
-
-        self.D = nn.Parameter(torch.randn(E * H))                     # (E*H)
-
-        self.act = nn.SiLU()
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
-    def _ssm_kernel(self, L: int) -> torch.Tensor:
-        """
-        Compute SSM convolution kernels for all experts via ZOH discretization.
+        self.d_conv = d_conv
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            bias=conv_bias,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            padding=d_conv - 1,
+            **factory_kwargs,
+        ) if d_conv > 0 else nn.Identity()
 
-        K[e, h, t] = 2 * Re( sum_n  C[e,h,n] * Bbar[e,h,n] * Abar[e,h,n]^t )
+        self.WQ = nn.Linear(self.d_inner, self.d_intermediate + 3 * self.basis_mode)
+        self.state_router = AttentiveRouter(
+            self.d_inner,
+            self.d_state,
+            self.d_intermediate,
+            self.state_top_k,
+        )
+        self.dt_router = AttentiveRouter(
+            self.d_inner,
+            self.d_inner,
+            self.d_intermediate,
+            self.dt_top_k,
+        )
+            
+        self.activation = "silu"
+        self.act = nn.SiLU()
 
-        Returns: (E*H, L) real tensor
-        """
-        dt = torch.exp(self.log_dt)                                   # (E * H)
-        A = -torch.exp(self.log_A_real) + 1j * self.A_imag           # (E * H, N2) complex
-        B = torch.view_as_complex(self.B.contiguous())                # (E * H, N2) complex
-        C = torch.view_as_complex(self.C.contiguous())                # (E * H, N2) complex
+        # DELTA
+        dt = torch.rand(self.dt_num_experts, self.d_inner) \
+            * (dt_max - dt_min) + dt_min
+        self.dt = nn.Parameter(dt)
 
-        # ZOH discretization
-        dtA = A * dt.unsqueeze(-1)                                    # (E * H, N2)
-        Abar = torch.exp(dtA)                                         # (E * H, N2)
-        A_safe = torch.where(A.abs() < 1e-6, A + 1e-6, A)
-        Bbar = B * (Abar - 1.0) / A_safe                             # (E * H, N2)
+        # A-matrix
+        A = repeat(
+            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
+            "n -> d n",
+            d=self.d_inner,
+        ).contiguous()
+        A_log = torch.log(A)  # Keep A_log in fp32
+        self.A_log = nn.Parameter(A_log)
+        self.A_log._no_weight_decay = True
 
-        log_Abar = torch.log(Abar + 1e-30)                           # (E * H, N2) complex
-        t = torch.arange(L, device=self.log_dt.device, dtype=torch.float32)
-        powers = torch.exp(t.view(1, 1, L) * log_Abar.unsqueeze(-1))  # (E * H, N2, L)
+        # B, C, D
+        B = torch.ones(self.state_num_experts, self.d_state, dtype=torch.float32)
+        self.B = nn.Parameter(B)
+        C = torch.randn(self.state_num_experts, self.d_state, dtype=torch.float32)
+        self.C = nn.Parameter(C)
+        self.D = nn.Parameter(torch.ones(self.d_inner, device=device))
+        self.D._no_weight_decay = True
 
-        CB = (C * Bbar).unsqueeze(-1)
-        K = 2.0 * (CB * powers).sum(dim=-2).real
-        return K
-
-    def _fft_conv(self, u: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
-        """
-        Causal linear convolution via FFT.
-        u: (B, E * H, L),  K: (E * H, L)  ->  (B, E * H, L)
-        """
-        L = u.shape[-1]
-        fft_len = 2 * L  # zero-pad to avoid circular wrap-around
-        U = torch.fft.rfft(u.float(), n=fft_len)
-        K_ = torch.fft.rfft(K.float(), n=fft_len)
-        Y = U * K_.unsqueeze(0)
-        return torch.fft.irfft(Y, n=fft_len)[..., :L].to(u.dtype)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        **kwargs,
+    def forward(self,
+        hidden_states,
+        mixture_temperature: float = 1.0,
+        straight_through: bool = True,
+        uniform_topk_eps: float = 0.0,
+        inference_params=None
     ):
         """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
         """
-        B, L, _ = hidden_states.shape
-        E, H = self.num_experts, self.d_inner
 
-        # Project to (x, z): x goes through SSM, z gates the output
-        xz = self.in_proj(hidden_states)                              # (B, L, 2*H)
-        x, z = xz.chunk(2, dim=-1)                                   # (B, L, H) each
-        x = x.transpose(1, 2)                                        # (B, H, L)
+        if self.training:
+            self.last_orthogonal_loss = 0.0
+            params = (self.dt, self.B, self.C)
+            coefs = (self.orthogonal_loss_coef_dt, self.orthogonal_loss_coef_state, self.orthogonal_loss_coef_state)
+            for param, coef in zip(params, coefs):
+                W = param if self.basis_mode else F.normalize(param, dim=1)
+                self.last_orthogonal_loss += (W @ W.T - torch.eye(W.size(0), device=W.device)).pow(2).sum() * coef
+            self.last_orthogonal_loss
 
-        x_flat = x.unsqueeze(1).expand(-1, E, -1, -1).flatten(1, 2)  # (B, E * H, L)
-        # x_flat = repeat(x, "b h l -> b (e h) l", e=E)
+        # print(f"mixer: {type(hidden_states)}")
+        batch, seqlen, dim = hidden_states.shape
 
-        K = self._ssm_kernel(L)
-        y = self._fft_conv(x_flat, K)     # (B, E * H, L)
-        y = (y + self.D[None, :, None] * x_flat).reshape(B, E, H, L)
+        conv_state, ssm_state = None, None
+        if inference_params is not None:
+            conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
+            if inference_params.seqlen_offset > 0:
+                # The states are updated inplace
+                out, _, _ = self.step(hidden_states, conv_state, ssm_state)
+                return out
 
-        # Weight by routing scores and sum over experts
-        y = y.permute(0, 3, 1, 2).flatten(0, 1)  # (BL, E, H)
-        x = x.permute(0, 2, 1).flatten(0, 1).unsqueeze(1)  # (BL, 1, H)
-        y = self.router(x, y, y).squeeze(1).reshape(B, L, H)  # (B, L, H)
-        # y = y.mean(1).reshape(B, L, H)
+        # We do matmul and transpose BLH -> HBL at the same time
+        xz = self.in_proj(hidden_states)
+        x, z = xz.chunk(2, dim=-1)  # (B, L, H) each
+        x, z = x.transpose(-1, -2), z.transpose(-1, -2)
 
-        y = self.act(y) * torch.sigmoid(z)                           # GLU gate
-        y = self.dropout(y)
-        y = self.out_proj(y)                                         # (B, L, D)
-        return y
+        A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
 
-    def state_size(self, sequence_length: int = 2048) -> int:
-        return self.d_inner * self.d_state * self.num_experts
+        # Compute short convolution
+
+        if conv_state is not None:
+            conv_state.copy_(x[:, :, -self.d_conv :])  # Update state (B D W)
+        if self.d_conv > 0:
+            if causal_conv1d_fn is None:
+                x = self.act(self.conv1d(x)[..., :seqlen])
+            else:
+                assert self.activation in ["silu", "swish"]
+                weight = rearrange(self.conv1d.weight, "d 1 w -> d w")
+                # print(x.shape, weight.shape)
+                x = causal_conv1d_fn(
+                    x,
+                    weight=weight,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    seq_idx=None,
+                )
+
+        query, mults = self.WQ(x.transpose(-1, -2)), [None] * 3
+        if self.basis_mode:
+            query, mults = query[..., :-3], query[..., -3:].permute(2, 0, 1)
+
+        dt = self.dt_router(
+            query,
+            self.dt,
+            mult=mults[0],
+            mixture_temperature=mixture_temperature,
+            straight_through=straight_through,
+            uniform_topk_eps=uniform_topk_eps,
+        )[0].transpose(-1, -2)
+        B = self.state_router(
+            query,
+            self.B,
+            mult=mults[1],
+            mixture_temperature=mixture_temperature,
+            straight_through=straight_through,
+            uniform_topk_eps=uniform_topk_eps)[0].transpose(-1, -2)
+        C = self.state_router(
+            query,
+            self.C,
+            mult=mults[2],
+            mixture_temperature=mixture_temperature,
+            straight_through=straight_through,
+            uniform_topk_eps=uniform_topk_eps)[0].transpose(-1, -2)
+
+        assert self.activation in ["silu", "swish"]
+        y = selective_scan_fn(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            self.D.float(),
+            z=z,
+            delta_softplus=True,
+            return_last_state=ssm_state is not None,
+        )
+        if ssm_state is not None:
+            y, last_state = y
+            ssm_state.copy_(last_state)
+        y = rearrange(y, "b d l -> b l d")
+        out = self.out_proj(y)
+        return out
+
+    def step(self, hidden_states, conv_state, ssm_state):
+        dtype = hidden_states.dtype
+        assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
+        xz = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
+        x, z = xz.chunk(2, dim=-1)  # (B D)
+
+        # Conv step
+        if self.d_conv > 0:
+            if causal_conv1d_update is None:
+                conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
+                conv_state[:, :, -1] = x
+                x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
+                if self.conv1d.bias is not None:
+                    x = x + self.conv1d.bias
+                x = self.act(x).to(dtype=dtype)
+            else:
+                x = causal_conv1d_update(
+                    x,
+                    conv_state,
+                    rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                    self.conv1d.bias,
+                    self.activation,
+                )
+
+        alpha_dt, alpha_b, alpha_c = [
+            router(
+                x,
+                noise_scale=0,
+                mixture_temperature=1.0,
+                straight_through=True,
+                uniform_topk_eps=0,
+            )[0] for router in self.router
+        ]
+
+        dt = self.dt_proj(alpha_dt @ self.log_dt)
+        A = -torch.exp(self.A_log.float())
+        B = (alpha_b @ self.B)  # (B, N)
+        C = (alpha_c @ self.C)  # (B, N)
+
+        # SSM step
+        if selective_state_update is None:
+            # Discretize A and B
+            dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
+            dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
+            dB = torch.einsum("bd,bn->bdn", dt, B)
+            ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
+            y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)
+            y = y + self.D.to(dtype) * x
+            y = y * self.act(z)  # (B D)
+        else:
+            y = selective_state_update(
+                ssm_state, x, dt, A, B, C, self.D, z=z, dt_bias=self.dt_proj.bias, dt_softplus=True
+            )
+
+        out = self.out_proj(y)
+        return out.unsqueeze(1), conv_state, ssm_state
+    
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        device = self.out_proj.weight.device
+        conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
+        conv_state = torch.zeros(
+            batch_size, self.d_model * self.expand, self.d_conv, device=device, dtype=conv_dtype
+        )
+        ssm_dtype = self.dt_proj.weight.dtype if dtype is None else dtype
+        # ssm_dtype = torch.float32
+        ssm_state = torch.zeros(
+            batch_size, self.d_model * self.expand, self.d_state, device=device, dtype=ssm_dtype
+        )
+        return conv_state, ssm_state
+
+    def _get_states_from_cache(self, inference_params, batch_size, initialize_states=False):
+        assert self.layer_idx is not None
+        if self.layer_idx not in inference_params.key_value_memory_dict:
+            batch_shape = (batch_size,)
+            conv_state = torch.zeros(
+                batch_size,
+                self.d_model * self.expand,
+                self.d_conv,
+                device=self.conv1d.weight.device,
+                dtype=self.conv1d.weight.dtype,
+            )
+            ssm_state = torch.zeros(
+                batch_size,
+                self.d_model * self.expand,
+                self.d_state,
+                device=self.dt_proj.weight.device,
+                dtype=self.dt_proj.weight.dtype,
+                # dtype=torch.float32,
+            )
+            inference_params.key_value_memory_dict[self.layer_idx] = (conv_state, ssm_state)
+        else:
+            conv_state, ssm_state = inference_params.key_value_memory_dict[self.layer_idx]
+            # TODO: What if batch size changes between generation, and we reuse the same states?
+            if initialize_states:
+                conv_state.zero_()
+                ssm_state.zero_()
+        return conv_state, ssm_state
+
+    def get_auxiliary_loss(self):
+        return self.last_orthogonal_loss
 
 
-class S4DMoEAttnBlock(nn.Module):
+class FantasticAttentiveBlock(nn.Module):
+    """Один блок: RMSNorm → Mamba → residual"""
     def __init__(
-        self, config, residual_in_fp32=True, norm_epsilon=1e-5, **factory_kwargs
-    ):
-        """
-        Block wrapping S4DMoEv3 with LayerNorm and residual connection, mirroring MambaBlock.
-
-        Structure (prenorm):  Add -> LN -> S4DMoEAttnM
-        Returns both hidden_states and residual so the caller can chain blocks.
-        """
-        super().__init__()
-        d_model = config.d_model
-        self.residual_in_fp32 = residual_in_fp32
-        self.mixer = S4DMoEAttn(d_model, **factory_kwargs, **config.sequence_mixer.kwargs)
-        self.norm = nn.LayerNorm(d_model, eps=norm_epsilon)
-
-    def forward(
         self,
-        hidden_states: Tensor,
-        residual: Optional[Tensor] = None,
+        d_model,
+        d_intermediate: int|str = "auto",
+        d_state=16,
+        d_conv=4,
+        expand=2,
+        basis_mode: bool = False,
+        orthogonal_loss_coef_state: float = 0.0,
+        orthogonal_loss_coef_dt: float = 0.0,
+        state_num_experts: int|str = "auto",
+        state_top_k: int|str = "auto",
+        dt_num_experts: int|str = "auto",
+        dt_top_k: int|str = "auto",
     ):
-        """
-        hidden_states: the sequence to the encoder layer (required).
-        residual: hidden_states = Mixer(LN(residual))
-        """
-        residual = (hidden_states + residual) if residual is not None else hidden_states
-        hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
-        if self.residual_in_fp32:
-            residual = residual.to(torch.float32)
-        hidden_states = self.mixer(hidden_states)
-        return hidden_states, residual
+        super().__init__()
+        self.norm = RMSNorm(d_model)
+        self.fantastic = FantasticAttentive(
+            d_model=d_model,
+            d_intermediate=d_intermediate,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            basis_mode=basis_mode,
+            orthogonal_loss_coef_state=orthogonal_loss_coef_state,
+            orthogonal_loss_coef_dt=orthogonal_loss_coef_dt,
+            state_num_experts=state_num_experts,
+            state_top_k=state_top_k,
+            dt_num_experts=dt_num_experts,
+            dt_top_k=dt_top_k,
+        )
+
+    def forward(self, x):
+        return x + self.fantastic(self.norm(x))
+
+
+class FantasticAttentiveSSM(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        n_layers: int = 24,
+        d_model: int = 768,
+        d_intermediate: int|str = "auto",
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        basis_mode: bool = False,
+        orthogonal_loss_coef_state: float = 0.0,
+        orthogonal_loss_coef_dt: float = 0.0,
+        state_num_experts: int|str = "auto",
+        state_top_k: int|str = "auto",
+        dt_num_experts: int|str = "auto",
+        dt_top_k: int|str = "auto",
+        pad_vocab_size_multiple: int = 8,
+        **kwargs,
+    ):
+        super().__init__()
+
+        # Выравниваем vocab_size до кратного 8 (для эффективности)
+        if vocab_size % pad_vocab_size_multiple != 0:
+            vocab_size += pad_vocab_size_multiple - (vocab_size % pad_vocab_size_multiple)
+
+        self.embedding = nn.Embedding(vocab_size, d_model)
+
+        self.layers = nn.ModuleList([
+            FantasticAttentiveBlock(
+                d_model=d_model,
+                d_intermediate=d_intermediate,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                basis_mode=basis_mode,
+                orthogonal_loss_coef_state=orthogonal_loss_coef_state,
+                orthogonal_loss_coef_dt=orthogonal_loss_coef_dt,
+                state_num_experts=state_num_experts,
+                state_top_k=state_top_k,
+                dt_num_experts=dt_num_experts,
+                dt_top_k=dt_top_k,
+            ) for _ in range(n_layers)
+        ])
+
+        self.norm_f = RMSNorm(d_model)  # финальная нормализация
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+        # Weight tying — стандартная практика
+        self.lm_head.weight = self.embedding.weight
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.embedding.weight, std=0.02)
+        # Mamba инициализирует себя сама внутри
+
+    def forward(self, input_ids):
+        x = self.embedding(input_ids)      # (B, L, d_model)
+
+        for layer in self.layers:
+            x = layer(x)                   # (B, L, d_model)
+
+        x = self.norm_f(x)
+        logits = self.lm_head(x)           # (B, L, vocab_size)
+        return logits

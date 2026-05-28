@@ -416,6 +416,7 @@ class FantasticSSM(nn.Module):
         basis_mode: bool = False,
         orthogonal_loss_coef: float = 0.0,
         separate_routing: bool = False,
+        **kwargs,
     ):
         super().__init__()
 

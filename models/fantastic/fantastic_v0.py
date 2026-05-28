@@ -304,6 +304,7 @@ class Fantastic_v0_SSM(nn.Module):
         dt_strategy: str = "random",
         pad_vocab_size_multiple: int = 8,
         dropout: float = 0.0,
+        **kwargs,
     ):
         super().__init__()
 

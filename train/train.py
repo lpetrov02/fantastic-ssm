@@ -36,6 +36,7 @@ from models.mamba.mamba import Mamba130M
 from models.fantastic.fantastic_ssm import FantasticSSM
 from models.fantastic.fantastic_v0 import Fantastic_v0_SSM
 from models.fantastic.fantastic_v2 import Fantastic_v2_SSM
+from models.attentive.attentive import FantasticAttentiveSSM
 from models.s4.s4d import S4DLanguageModel
 from models.attention.mha import Transformer130M
 from train_data.data_loader import ShardedDataLoader, ValDataLoader
@@ -57,7 +58,7 @@ def parse_args():
     p.add_argument("--checkpoint_dir", default="./experiments/checkpoints")
 
     # model
-    p.add_argument("--model",       choices=["mamba", "fantastic", "fantastic_v0", "fantastic_v2", "s4d", "transformer"], default="mamba")
+    p.add_argument("--model",       choices=["mamba", "fantastic", "fantastic_v0", "fantastic_v2", "attentive", "s4d", "transformer"], default="mamba")
     p.add_argument("--model_name",  type=str)
     p.add_argument("--vocab_size",  type=int,   default=50257)
     p.add_argument("--d_model",     type=int,   default=768)
@@ -77,8 +78,10 @@ def parse_args():
     p.add_argument("--separate_routing", action="store_true", help="Fantastic_mode")
 
     p.add_argument("--dt_rank",        type=str,   default="auto",   help="Fantastic-v2 only")
-    p.add_argument("--dt_num_experts",        type=str,   default="auto",   help="Fantastic-v2 only")
-    p.add_argument("--dt_top_k",              type=str,   default="auto",   help="Fantastic-v2 only")    
+    p.add_argument("--dt_num_experts",        type=str,   default="auto",   help="Fantastic-v2 & Attentive")
+    p.add_argument("--dt_top_k",              type=str,   default="auto",   help="Fantastic-v2 & Attentive")
+    p.add_argument("--d_intermediate",        type=str,   default="auto",   help="Fantastic-Attentive only")
+    p.add_argument("--orthogonal_loss_coef_dt", type=float, default=0.0, help="Fantastic-Attentive only")
 
     p.add_argument("--dropout",       type=float,   default=0.0,   help="S4DLanguageModel only")
     p.add_argument("--ff_mult",       type=int,   default=2,   help="FFN multiplier (S4DLanguageModel default=2; use 4 for transformer)")
@@ -98,6 +101,7 @@ def parse_args():
     # logging / checkpointing
     p.add_argument("--log_every",  type=int, default=10)
     p.add_argument("--val_every",  type=int, default=500)
+    p.add_argument("--max_val_batches",  type=int, default=None)
     p.add_argument("--save_every", type=int, default=1000)
     p.add_argument("--keep_ckpts", type=int, default=3, help="how many checkpoints to keep")
 
@@ -181,6 +185,23 @@ def build_model(args) -> nn.Module:
             dt_num_experts=args.dt_num_experts,
             dt_top_k=args.dt_top_k,
         )
+    elif args.model == "attentive":
+        return FantasticAttentiveSSM(
+            vocab_size=args.vocab_size,
+            d_model=args.d_model,
+            n_layers=args.n_layers,
+            d_intermediate=args.d_intermediate,
+            d_state=args.d_state,
+            d_conv=args.d_conv,
+            expand=args.expand,
+            basis_mode=args.basis_mode,
+            orthogonal_loss_coef_state=args.orthogonal_loss_coef,
+            orthogonal_loss_coef_dt=args.orthogonal_loss_coef_dt,
+            state_num_experts=args.num_experts,
+            state_top_k=args.top_k,
+            dt_num_experts=args.dt_num_experts,
+            dt_top_k=args.dt_top_k,
+        )
     elif args.model == "fantastic_v0":
         return Fantastic_v0_SSM(
             vocab_size=args.vocab_size,
@@ -237,7 +258,8 @@ def apply_pretrained_embeddings(model: nn.Module, args, is_main: bool):
         )
 
     with torch.no_grad():
-        model.embedding.weight.copy_(gpt2_emb)
+        num_embeds = gpt2_emb.shape[0]
+        model.embedding.weight.data[:num_embeds].copy_(gpt2_emb)
 
     if args.freeze_embeds:
         model.embedding.weight.requires_grad_(False)
@@ -336,14 +358,17 @@ def load_checkpoint(path: str, raw_model: nn.Module, optimizer, device) -> int:
 # ── Validation ────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def validate(raw_model: nn.Module, val_loader: ValDataLoader, device) -> float:
+def validate(raw_model: nn.Module, val_loader: ValDataLoader, device, max_batches=None) -> float:
     raw_model.eval()
     total_loss, n = 0.0, 0
+
     for x, y in val_loader:
         x, y = x.to(device), y.to(device)
         logits = raw_model(x)
         total_loss += F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1)).item()
         n += 1
+        if max_batches and n >= max_batches:
+            break
     raw_model.train()
     return total_loss / n if n > 0 else float("nan")
 
@@ -476,7 +501,7 @@ def main():
 
         # ── Validation ────────────────────────────────────────────────
         if is_main and step > 0 and step % args.val_every == 0:
-            val_loss = validate(raw_model, val_loader, device)
+            val_loss = validate(raw_model, val_loader, device, max_batches=args.max_val_batches)
             print(f"  val  loss {val_loss:.4f} | ppl {math.exp(val_loss):.2f}")
             writer.add_scalar("val/loss", val_loss,              step)
             writer.add_scalar("val/ppl",  math.exp(val_loss),    step)
