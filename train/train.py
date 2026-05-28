@@ -39,7 +39,13 @@ from models.fantastic.fantastic_v2 import Fantastic_v2_SSM
 from models.attentive.attentive import FantasticAttentiveSSM
 from models.s4.s4d import S4DLanguageModel
 from models.attention.mha import Transformer130M
+from torch.utils.data import DataLoader, DistributedSampler
+from transformers import GPT2Tokenizer
 from train_data.data_loader import ShardedDataLoader, ValDataLoader
+from train_data.niah_dataset import NIAHDataset, collate_niah, TRAIN_BASE_SEED
+
+# Separate seed for NIAH validation — distinct from train (1337) and eval (42).
+_NIAH_VAL_SEED = 2025
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -113,6 +119,21 @@ def parse_args():
 
     # resume
     p.add_argument("--resume", default=None, help="path to checkpoint to resume from")
+    p.add_argument("--resume_weights_only", action="store_true", default=False,
+                   help="Load only model weights from --resume, not optimizer state. "
+                        "Use this when starting NIAH fine-tuning from a pretrained checkpoint.")
+
+    # NIAH fine-tuning
+    p.add_argument("--niah", action="store_true", default=False,
+                   help="Fine-tune on NIAH (passkey retrieval) instead of language modelling")
+    p.add_argument("--niah_context_lengths", nargs="+", type=int, default=[2048],
+                   help="Context lengths to include in NIAH training samples")
+    p.add_argument("--niah_n_depths", type=int, default=9,
+                   help="Number of evenly-spaced needle depths per context length")
+    p.add_argument("--niah_n_samples", type=int, default=50,
+                   help="Repeats per (context_length, depth) cell in training set")
+    p.add_argument("--niah_batch_size", type=int, default=None,
+                   help="Batch size for NIAH (defaults to --batch_size if unset)")
 
     args = p.parse_args()
     checkpoint_path = os.path.join(args.checkpoint_dir, args.model_name)
@@ -348,11 +369,14 @@ def save_checkpoint(step: int, raw_model: nn.Module, optimizer, args) -> Path:
     return path
 
 
-def load_checkpoint(path: str, raw_model: nn.Module, optimizer, device) -> int:
+def load_checkpoint(path: str, raw_model: nn.Module, optimizer, device,
+                    weights_only: bool = False) -> int:
     ckpt = torch.load(path, map_location=device)
-    raw_model.load_state_dict(ckpt["model"])
-    optimizer.load_state_dict(ckpt["optimizer"])
-    return ckpt["step"]
+    state = {k.replace("module.", ""): v for k, v in ckpt["model"].items()}
+    raw_model.load_state_dict(state, strict=True)
+    if not weights_only:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    return ckpt.get("step", 0)
 
 
 # ── Validation ────────────────────────────────────────────────────────────────
@@ -369,6 +393,21 @@ def validate(raw_model: nn.Module, val_loader: ValDataLoader, device, max_batche
         n += 1
         if max_batches and n >= max_batches:
             break
+    raw_model.train()
+    return total_loss / n if n > 0 else float("nan")
+
+
+@torch.no_grad()
+def _validate_niah(raw_model: nn.Module, val_loader, device) -> float:
+    raw_model.eval()
+    total_loss, n = 0.0, 0
+    for x, y in val_loader:
+        x, y = x.to(device), y.to(device)
+        logits = raw_model(x)
+        total_loss += F.cross_entropy(
+            logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-100
+        ).item()
+        n += 1
     raw_model.train()
     return total_loss / n if n > 0 else float("nan")
 
@@ -395,25 +434,70 @@ def main():
     # ── Resume ────────────────────────────────────────────────────────
     start_step = 0
     if args.resume:
-        start_step = load_checkpoint(args.resume, raw_model, optimizer, device)
+        start_step = load_checkpoint(
+            args.resume, raw_model, optimizer, device,
+            weights_only=args.resume_weights_only,
+        )
         if is_main:
-            print(f"Resumed from {args.resume} at step {start_step}")
+            mode = "weights only" if args.resume_weights_only else "full"
+            print(f"Resumed from {args.resume} at step {start_step} ({mode})")
+        if args.resume_weights_only:
+            start_step = 0  # fresh fine-tune run — reset step counter
 
     # ── Data ──────────────────────────────────────────────────────────
-    train_loader = ShardedDataLoader(
-        data_dir=args.data_dir,
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-        rank=rank,
-        world_size=world_size,
-        seed=42,
-    )
-    # Validation runs on rank-0 only (ValDataLoader is not DDP-aware)
-    val_loader = ValDataLoader(
-        data_dir=args.val_dir,
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-    ) if is_main else None
+    if args.niah:
+        tok = GPT2Tokenizer.from_pretrained("gpt2")
+        niah_bs = args.niah_batch_size or args.batch_size
+
+        train_ds = NIAHDataset(
+            tokenizer=tok,
+            n_samples=args.niah_n_samples,
+            context_lengths=args.niah_context_lengths,
+            n_depths=args.niah_n_depths,
+            base_seed=TRAIN_BASE_SEED,
+        )
+        train_sampler = DistributedSampler(
+            train_ds, num_replicas=world_size, rank=rank, shuffle=True
+        )
+        train_loader = DataLoader(
+            train_ds, batch_size=niah_bs, sampler=train_sampler,
+            collate_fn=collate_niah, drop_last=True,
+        )
+
+        if is_main:
+            val_ds = NIAHDataset(
+                tokenizer=tok,
+                n_samples=20,
+                context_lengths=args.niah_context_lengths,
+                n_depths=args.niah_n_depths,
+                base_seed=_NIAH_VAL_SEED,
+            )
+            val_loader = DataLoader(
+                val_ds, batch_size=niah_bs, collate_fn=collate_niah
+            )
+        else:
+            val_loader = None
+
+        if is_main:
+            print(
+                f"NIAH mode | train={len(train_ds)} samples | "
+                f"val={len(val_ds)} samples | batch={niah_bs}"
+            )
+    else:
+        train_loader = ShardedDataLoader(
+            data_dir=args.data_dir,
+            seq_len=args.seq_len,
+            batch_size=args.batch_size,
+            rank=rank,
+            world_size=world_size,
+            seed=42,
+        )
+        # Validation runs on rank-0 only (ValDataLoader is not DDP-aware)
+        val_loader = ValDataLoader(
+            data_dir=args.val_dir,
+            seq_len=args.seq_len,
+            batch_size=args.batch_size,
+        ) if is_main else None
 
     # ── TensorBoard (rank 0 only) ──────────────────────────────────────
     writer = None
@@ -425,14 +509,23 @@ def main():
     # ── Training loop ─────────────────────────────────────────────────
     model.train()
     step = start_step
-    tokens_per_log = (
-        args.batch_size * world_size * args.seq_len
-        * args.grad_accum_steps * args.log_every
-    )
 
-    def infinite_batches():
-        while True:
-            yield from train_loader
+    if args.niah:
+        # DistributedSampler requires set_epoch each pass for proper shuffling.
+        def infinite_batches():
+            epoch = 0
+            while True:
+                train_sampler.set_epoch(epoch)
+                yield from train_loader
+                epoch += 1
+    else:
+        tokens_per_log = (
+            args.batch_size * world_size * args.seq_len
+            * args.grad_accum_steps * args.log_every
+        )
+        def infinite_batches():
+            while True:
+                yield from train_loader
 
     data = infinite_batches()
     t0 = time.perf_counter()
@@ -454,7 +547,13 @@ def main():
             )
             with sync_ctx:
                 logits = model(x)
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+                if args.niah:
+                    # y has -100 at context positions; loss on answer tokens only
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-100
+                    )
+                else:
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
                 loss = loss / args.grad_accum_steps
                 aux = collect_aux_loss(raw_model)
                 if aux is not None:
@@ -477,7 +576,6 @@ def main():
         # ── Logging ───────────────────────────────────────────────────
         if is_main and step % args.log_every == 0:
             t1 = time.perf_counter()
-            tok_per_sec = tokens_per_log / (t1 - t0)
 
             entropies = collect_router_entropies(raw_model)
             entropy_str = ""
@@ -490,21 +588,33 @@ def main():
                 for i, h in enumerate(entropies):
                     writer.add_scalar(f"router/entropy/layer_{i}", h, step)
 
-            print(
-                f"step {step:7d} | loss {accum_loss:.4f} | lr {lr:.2e}"
-                f" | {tok_per_sec / 1e3:.1f}k tok/s{entropy_str}"
-            )
-            writer.add_scalar("train/loss",           accum_loss,  step)
-            writer.add_scalar("train/lr",             lr,          step)
-            writer.add_scalar("train/tokens_per_sec", tok_per_sec, step)
+            if args.niah:
+                elapsed = t1 - t0
+                print(
+                    f"step {step:7d} | niah_loss {accum_loss:.4f} | lr {lr:.2e}"
+                    f" | {elapsed:.1f}s{entropy_str}"
+                )
+            else:
+                tok_per_sec = tokens_per_log / (t1 - t0)
+                print(
+                    f"step {step:7d} | loss {accum_loss:.4f} | lr {lr:.2e}"
+                    f" | {tok_per_sec / 1e3:.1f}k tok/s{entropy_str}"
+                )
+                writer.add_scalar("train/tokens_per_sec", tok_per_sec, step)
+
+            writer.add_scalar("train/loss", accum_loss, step)
+            writer.add_scalar("train/lr",   lr,         step)
             t0 = t1
 
         # ── Validation ────────────────────────────────────────────────
         if is_main and step > 0 and step % args.val_every == 0:
-            val_loss = validate(raw_model, val_loader, device, max_batches=args.max_val_batches)
+            if args.niah:
+                val_loss = _validate_niah(raw_model, val_loader, device)
+            else:
+                val_loss = validate(raw_model, val_loader, device, max_batches=args.max_val_batches)
             print(f"  val  loss {val_loss:.4f} | ppl {math.exp(val_loss):.2f}")
-            writer.add_scalar("val/loss", val_loss,              step)
-            writer.add_scalar("val/ppl",  math.exp(val_loss),    step)
+            writer.add_scalar("val/loss", val_loss,           step)
+            writer.add_scalar("val/ppl",  math.exp(val_loss), step)
 
         # ── Checkpoint ────────────────────────────────────────────────
         if is_main and step > 0 and step % args.save_every == 0:
