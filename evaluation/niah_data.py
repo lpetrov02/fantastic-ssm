@@ -48,7 +48,6 @@ class NIAHSample:
 
 def _random_passkey() -> str:
     return str(random.randint(10000, 99999))
-    # return "".join([str(random.randint(0, 9)) for _ in range(30)])
 
 
 def _build_haystack(tokenizer, n_tokens: int, rng: random.Random) -> List[int]:
@@ -65,6 +64,7 @@ def build_sample(
     depth_pct: float,
     passkey: Optional[str] = None,
     seed: Optional[int] = None,
+    make_random: bool = False,
 ) -> NIAHSample:
     """
     Build one NIAH sample.
@@ -75,12 +75,13 @@ def build_sample(
     rng = random.Random(seed)
 
     if passkey is None:
-        # passkey = str(rng.randint(10000, 99999))
-        passkey = "".join([str(random.randint(0, 9)) for _ in range(30)])
+        passkey = _random_passkey()
 
     needle_ids = tokenizer.encode(NEEDLE_TEMPLATE.format(passkey=passkey))
     query_ids = tokenizer.encode(QUERY_PREFIX)
-    answer_ids = tokenizer.encode(" " + passkey)
+
+    final_passkey = _random_passkey() if make_random else passkey
+    answer_ids = tokenizer.encode(" " + final_passkey)
 
     haystack_budget = context_length - len(needle_ids) - len(query_ids)
     if haystack_budget < 4:
@@ -120,6 +121,7 @@ def build_grid(
     depth_pcts: List[float],
     n_samples: int = 10,
     base_seed: int = 42,
+    make_random: bool = False,
 ) -> dict:
     """
     Build all (context_length, depth_pct) × n_samples samples.
@@ -140,6 +142,7 @@ def build_grid(
                         context_length=ctx_len,
                         depth_pct=depth,
                         seed=seed,
+                        make_random=make_random,
                     )
                 )
             grid[ctx_len][depth] = samples

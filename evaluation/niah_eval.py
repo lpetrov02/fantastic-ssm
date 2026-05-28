@@ -36,6 +36,7 @@ from models.mamba.mamba import Mamba130M
 from models.fantastic.fantastic_ssm import FantasticSSM
 from models.fantastic.fantastic_v0 import Fantastic_v0_SSM
 from models.fantastic.fantastic_v2 import Fantastic_v2_SSM
+from models.attentive.attentive import FantasticAttentiveSSM
 from models.s4.s4d import S4DLanguageModel
 
 from evaluation.niah_data import build_grid, NIAHSample
@@ -55,6 +56,22 @@ def build_model(args: dict):
 
     if model_type == "mamba":
         return Mamba130M(**common)
+
+    if model_type == "attentive":
+        return FantasticAttentiveSSM(
+            **common,
+            d_intermediate=args.get("d_intermediate", "auto"),
+            d_state=args.get("d_state", 16),
+            d_conv=args.get("d_conv", 4),
+            expand=args.get("expand", 2),
+            basis_mode=args.get("basis_mode", False),
+            orthogonal_loss_coef_state=args.get("orthogonal_loss_coef", 0.0),
+            orthogonal_loss_coef_dt=args.get("orthogonal_loss_coef_dt", 0.0),
+            state_num_experts=args.get("num_experts", "auto"),
+            state_top_k=args.get("top_k", "auto"),
+            dt_num_experts=args.get("dt_num_experts", "auto"),
+            dt_top_k=args.get("dt_top_k", "auto"),
+        )
 
     if model_type in ("fantastic", "fantastic_v0", "fantastic_v2"):
         fantastic_kwargs = dict(
@@ -147,13 +164,14 @@ def run_evaluation(
     n_samples: int,
     batch_size: int,
     device: torch.device,
+    make_random: bool = False
 ) -> dict:
     """
     Evaluate on the full NIAH grid.
     Returns nested dict: results[ctx_len][depth_pct] = {"mean_loss": float, "mean_ppl": float}
     """
     print("Building sample grid …")
-    grid = build_grid(tokenizer, context_lengths, depth_pcts, n_samples=n_samples)
+    grid = build_grid(tokenizer, context_lengths, depth_pcts, n_samples=n_samples, make_random=make_random)
 
     results = {}
     total_cells = len(context_lengths) * len(depth_pcts)
@@ -205,6 +223,7 @@ def parse_args():
                    help="Samples per forward pass")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--make_random", action="store_true", default=False)
     return p.parse_args()
 
 
@@ -234,6 +253,7 @@ def main():
         n_samples=args.n_samples,
         batch_size=args.batch_size,
         device=device,
+        make_random=args.make_random,
     )
 
     output = {

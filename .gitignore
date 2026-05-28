@@ -8,3 +8,4 @@ train_data/data/*
 *tensorboard_logs*
 
 evaluation/evaluation*
+evaluation/data*
