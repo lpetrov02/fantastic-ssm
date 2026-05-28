@@ -1,4 +1,6 @@
-# Needle-in-a-Haystack Evaluation
+# Evaluations
+
+## Needle-in-a-Haystack (NIAH)
 
 Passkey-retrieval NIAH benchmark for all `fantastic-ssm` model variants.
 
@@ -30,6 +32,59 @@ The evaluation sweeps a grid of **context lengths × needle depths**, running `n
 | `run_niah.sh` | Shell script for a quick single-model run |
 
 Results are saved under `evaluation/results/`.
+
+---
+
+## Tiny-Shakespeare Perplexity
+
+Standard perplexity benchmark on the Tiny-Shakespeare corpus. The script downloads the dataset once (cached to `evaluation/data/shakespeare.txt`), tokenises it with the GPT-2 tokeniser, and evaluates the model on the last `test_fraction` of the text.
+
+### Quick start
+
+```bash
+python evaluation/shakespeare_eval.py \
+    --checkpoint checkpoints/step_10000.pt \
+    --output     evaluation/results/shakespeare_fantastic.json
+```
+
+### `shakespeare_eval.py` options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--checkpoint` | *(required)* | Path to `.pt` checkpoint |
+| `--output` | `evaluation/results/shakespeare.json` | Output JSON path |
+| `--seq_len` | `1024` | Sequence length for each evaluation chunk |
+| `--test_fraction` | `0.1` | Fraction of dataset used as test split (last N%) |
+| `--batch_size` | `4` | Chunks per forward pass |
+| `--device` | `cuda` / `cpu` | Inference device |
+| `--seed` | `42` | Random seed |
+
+### Output format
+
+```json
+{
+  "checkpoint": "checkpoints/step_10000.pt",
+  "model": "fantastic",
+  "model_step": 10000,
+  "eval_config": {
+    "seq_len": 1024,
+    "test_fraction": 0.1,
+    "seed": 42
+  },
+  "results": {
+    "mean_loss": 3.21,
+    "mean_ppl": 24.78,
+    "n_chunks": 42,
+    "per_chunk_losses": [...],
+    "quartiles": {
+      "q1": {"mean_loss": 3.10, "mean_ppl": 22.20},
+      "q2": {"mean_loss": 3.18, "mean_ppl": 24.05},
+      "q3": {"mean_loss": 3.25, "mean_ppl": 25.79},
+      "q4": {"mean_loss": 3.31, "mean_ppl": 27.38}
+    }
+  }
+}
+```
 
 ## Quick start
 
