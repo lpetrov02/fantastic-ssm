@@ -9,3 +9,5 @@ train_data/data/*
 
 evaluation/evaluation*
 evaluation/data*
+
+run_ft.sh

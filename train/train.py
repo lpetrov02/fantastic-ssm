@@ -235,6 +235,7 @@ def build_model(args) -> nn.Module:
             lb_coef=args.lb_coef,
             aux_free_bias_step=args.aux_free_bias_step,
             dt_strategy=args.dt_strategy,
+            orthogonal_loss_coef=args.orthogonal_loss_coef,
             ff_mult=args.ff_mult,
             dropout=args.dropout,
         )

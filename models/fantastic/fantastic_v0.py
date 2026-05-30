@@ -43,6 +43,7 @@ class Fantastic_v0(nn.Module):
         lb_coef: float = 0.01,
         aux_free_bias_step: float = 1e-3,
         dt_strategy: str = "random",
+        orthogonal_loss_coef: float = 0.0,
         device = None,
         dtype = None,
         **kwargs
@@ -56,6 +57,9 @@ class Fantastic_v0(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.dt_strategy = dt_strategy
+
+        self.orthogonal_loss_coef = orthogonal_loss_coef
+        self.last_orthogonal_loss = None
 
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
@@ -122,6 +126,15 @@ class Fantastic_v0(nn.Module):
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
         """
+
+        if self.training and self.orthogonal_loss_coef > 0:
+            self.last_orthogonal_loss = 0.0
+            params = (self.log_dt, self.B, self.C)
+            for param in params:
+                W = F.normalize(param, dim=1)
+                self.last_orthogonal_loss += (W @ W.T - torch.eye(W.size(0), device=W.device)).pow(2).sum()
+            self.last_orthogonal_loss *= self.orthogonal_loss_coef
+
         # print(f"mixer: {type(hidden_states)}")
         batch, seqlen, dim = hidden_states.shape
 
@@ -244,6 +257,9 @@ class Fantastic_v0(nn.Module):
                 ssm_state.zero_()
         return conv_state, ssm_state
 
+    def get_auxiliary_loss(self):
+        return self.last_orthogonal_loss
+
 
 class Fantastic_v0_Block(nn.Module):
     """Один блок: RMSNorm → Mamba → residual"""
@@ -257,6 +273,7 @@ class Fantastic_v0_Block(nn.Module):
         lb_coef: float = 0.01,
         aux_free_bias_step: float = 1e-3,
         dt_strategy: str = "random",
+        orthogonal_loss_coef: float = 0.0,
         ff_mult: int = 2,
         dropout: float = 0.0,
     ):
@@ -271,6 +288,7 @@ class Fantastic_v0_Block(nn.Module):
             lb_coef=lb_coef,
             aux_free_bias_step=aux_free_bias_step,
             dt_strategy=dt_strategy,
+            orthogonal_loss_coef=orthogonal_loss_coef,
         )
 
         self.norm2 = nn.RMSNorm(d_model)
@@ -302,6 +320,7 @@ class Fantastic_v0_SSM(nn.Module):
         lb_coef: float = 0.01,
         aux_free_bias_step: float = 1e-3,
         dt_strategy: str = "random",
+        orthogonal_loss_coef: float = 0.0,
         pad_vocab_size_multiple: int = 8,
         dropout: float = 0.0,
         **kwargs,
@@ -324,6 +343,7 @@ class Fantastic_v0_SSM(nn.Module):
                 lb_coef,
                 aux_free_bias_step,
                 dt_strategy,
+                orthogonal_loss_coef,
                 ff_mult,
                 dropout,
             ) for _ in range(n_layers)

@@ -3,9 +3,10 @@
 
 set -euo pipefail
 
-CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/mamba-130m-pretrained/step_0023000.pt"
+# CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/mamba-niah-ft/step_0001000.pt"
 # CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/fantastic-130m-e16a16-orth001-pretrained/step_0027000.pt"
 # CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/attentive-130m-pretrained/step_0006000.pt"
+CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/attentive-130m/step_0040000.pt"
 OUT_DIR="evaluation/results/niah"
 DEVICE="cuda"
 
