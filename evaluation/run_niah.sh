@@ -6,7 +6,10 @@ set -euo pipefail
 # CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/mamba-niah-ft/step_0001000.pt"
 # CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/fantastic-130m-e16a16-orth001-pretrained/step_0027000.pt"
 # CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/attentive-130m-pretrained/step_0006000.pt"
-CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/attentive-130m/step_0040000.pt"
+# CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/attentive-130m/step_0040000.pt"
+CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/mamba-130m/step_0020000.pt"
+# CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/fantastic-130m-s32-e32a32-orth001-sep/step_0020000.pt"
+
 OUT_DIR="evaluation/results/niah"
 DEVICE="cuda"
 
@@ -19,7 +22,8 @@ python niah_eval.py \
     --n_samples  100 \
     --batch_size 4 \
     --device     "$DEVICE" \
-\
+    # --shots 3
+# \
     # --output     "$OUT_DIR/niah_mamba_130m.json" \
 
 # ── plot ──────────────────────────────────────────────────────────────────────

@@ -110,6 +110,7 @@ def parse_args():
     p.add_argument("--max_val_batches",  type=int, default=None)
     p.add_argument("--save_every", type=int, default=1000)
     p.add_argument("--keep_ckpts", type=int, default=3, help="how many checkpoints to keep")
+    p.add_argument("--train_offset", type=int, default=0)
 
     # embeddings
     p.add_argument("--use_pretrained", action="store_true", default=False,
@@ -492,6 +493,7 @@ def main():
             rank=rank,
             world_size=world_size,
             seed=42,
+            offset=args.train_offset,
         )
         # Validation runs on rank-0 only (ValDataLoader is not DDP-aware)
         val_loader = ValDataLoader(

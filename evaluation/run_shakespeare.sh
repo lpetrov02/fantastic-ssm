@@ -3,7 +3,9 @@
 
 set -euo pipefail
 
-CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/attentive-130m-pretrained/step_0020000.pt"
+# CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/attentive-130m-pretrained/step_0020000.pt"
+# CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/attentive-130m/step_0040000.pt"
+CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/mamba-130m/step_0020000.pt"
 # CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/mamba-130m/step_0020000.pt"
 # CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/fantastic-130m-e16a16-orth001-pretrained/step_0023000.pt"
 # CHECKPOINT="/home/jovyan/shares/SR008.fs2/leopetrov/projects/fantastic/experiments/checkpoints/attentive-130m-pretrained/step_0018000.pt"

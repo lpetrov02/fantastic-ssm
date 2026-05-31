@@ -42,6 +42,7 @@ class ShardedDataLoader:
         world_size: int = 1,
         shuffle_shards: bool = True,
         seed: int = 42,
+        offset: int = 0,
     ):
         self.data_dir = Path(data_dir)
         self.seq_len = seq_len
@@ -50,6 +51,7 @@ class ShardedDataLoader:
         self.world_size = world_size
         self.shuffle_shards = shuffle_shards
         self.seed = seed
+        self.offset = offset
 
         # Ищем все шарды
         self.shards = sorted(self.data_dir.glob("shard_*.npy"))
@@ -101,6 +103,9 @@ class ShardedDataLoader:
                 continue
 
             for batch_i in range(n_global_batches):
+                while self.offset > 0:
+                    self.offset -= 1
+                    continue
                 # Глобальные индексы всех sequences в этом батче
                 global_seq_start = batch_i * global_batch_size
 

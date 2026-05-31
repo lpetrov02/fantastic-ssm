@@ -11,6 +11,8 @@ import random
 from dataclasses import dataclass
 from typing import List, Optional
 
+import numpy as np
+
 
 HAYSTACK_SENTENCES = [
     "The grass is green.",
@@ -65,6 +67,7 @@ def build_sample(
     passkey: Optional[str] = None,
     seed: Optional[int] = None,
     make_random: bool = False,
+    shots: int = 0,
 ) -> NIAHSample:
     """
     Build one NIAH sample.
@@ -72,6 +75,13 @@ def build_sample(
     context_length  -- total tokens in [haystack + needle + query]
     depth_pct       -- where in the haystack [0.0, 1.0] to insert the needle
     """
+
+    prefix = []
+    if shots > 0:
+        for _ in range(shots):
+            depth = np.random.choice(np.linspace(0.1, 1, 5))
+            prefix.append(build_sample(tokenizer, 64, depth, shots=0))
+
     rng = random.Random(seed)
 
     if passkey is None:
@@ -105,6 +115,19 @@ def build_sample(
 
     # print(tokenizer.decode(full_ids))
 
+    if prefix:
+        prefix_ids = tokenizer.encode("Examples:\n")
+        for sample in prefix:
+            prefix_ids += sample.input_ids
+            prefix_ids += tokenizer.encode("\n###\n")
+        prefix_ids += tokenizer.encode("Now your turn:\n")
+        full_ids = prefix_ids + full_ids
+        answer_start += len(prefix_ids)
+ 
+    # if shots > 0:
+    #     print(tokenizer.decode(full_ids))
+    #     raise ValueError()
+
     return NIAHSample(
         input_ids=full_ids,
         answer_start=answer_start,
@@ -122,6 +145,7 @@ def build_grid(
     n_samples: int = 10,
     base_seed: int = 42,
     make_random: bool = False,
+    shots: int = 0,
 ) -> dict:
     """
     Build all (context_length, depth_pct) × n_samples samples.
@@ -143,6 +167,7 @@ def build_grid(
                         depth_pct=depth,
                         seed=seed,
                         make_random=make_random,
+                        shots=shots,
                     )
                 )
             grid[ctx_len][depth] = samples

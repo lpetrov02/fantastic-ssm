@@ -164,14 +164,15 @@ def run_evaluation(
     n_samples: int,
     batch_size: int,
     device: torch.device,
-    make_random: bool = False
+    make_random: bool = False,
+    shots: int = 0,
 ) -> dict:
     """
     Evaluate on the full NIAH grid.
     Returns nested dict: results[ctx_len][depth_pct] = {"mean_loss": float, "mean_ppl": float}
     """
     print("Building sample grid …")
-    grid = build_grid(tokenizer, context_lengths, depth_pcts, n_samples=n_samples, make_random=make_random)
+    grid = build_grid(tokenizer, context_lengths, depth_pcts, n_samples=n_samples, make_random=make_random, shots=shots)
 
     results = {}
     total_cells = len(context_lengths) * len(depth_pcts)
@@ -224,6 +225,7 @@ def parse_args():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--make_random", action="store_true", default=False)
+    p.add_argument("--shots", type=int, default=0)
     return p.parse_args()
 
 
@@ -254,6 +256,7 @@ def main():
         batch_size=args.batch_size,
         device=device,
         make_random=args.make_random,
+        shots=args.shots,
     )
 
     output = {
