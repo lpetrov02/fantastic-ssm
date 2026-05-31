@@ -22,10 +22,11 @@ import os
 import sys
 import urllib.request
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
+from scipy import stats
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -192,19 +193,42 @@ def eval_chunks(
     return losses
 
 
+def confidence_interval(losses: List[float], confidence: float = 0.95) -> Tuple[float, float]:
+    """Return (lower, upper) CI for the mean loss using a t-distribution."""
+    n = len(losses)
+    if n < 2:
+        mean = losses[0] if losses else float("nan")
+        return mean, mean
+    mean = sum(losses) / n
+    se = stats.sem(losses)
+    h = se * stats.t.ppf((1 + confidence) / 2, df=n - 1)
+    return mean - h, mean + h
+
+
+def summarise_losses(losses: List[float], confidence: float = 0.95) -> dict:
+    mean = sum(losses) / len(losses)
+    lo, hi = confidence_interval(losses, confidence)
+    return {
+        "mean_loss": round(mean, 4),
+        "mean_ppl": round(math.exp(mean), 4),
+        "ci_loss": [round(lo, 4), round(hi, 4)],
+        "ci_ppl": [round(math.exp(lo), 4), round(math.exp(hi), 4)],
+    }
+
+
 def run_evaluation(
     model,
     chunks: List[List[int]],
     batch_size: int,
     device: torch.device,
+    confidence: float = 0.95,
 ) -> dict:
     n = len(chunks)
     print(f"Evaluating on {n} chunks …")
 
     all_losses = eval_chunks(model, chunks, batch_size, device)
 
-    mean_loss = sum(all_losses) / len(all_losses)
-    mean_ppl = math.exp(mean_loss)
+    overall = summarise_losses(all_losses, confidence)
 
     # Per-quartile breakdown (useful for spotting positional degradation)
     q = max(1, n // 4)
@@ -213,12 +237,11 @@ def run_evaluation(
         chunk = all_losses[i * q : (i + 1) * q]
         if not chunk:
             break
-        ql = sum(chunk) / len(chunk)
-        quartiles[label] = {"mean_loss": round(ql, 4), "mean_ppl": round(math.exp(ql), 4)}
+        quartiles[label] = summarise_losses(chunk, confidence)
 
     return {
-        "mean_loss": round(mean_loss, 4),
-        "mean_ppl": round(mean_ppl, 4),
+        **overall,
+        "confidence": confidence,
         "n_chunks": n,
         "per_chunk_losses": [round(l, 4) for l in all_losses],
         "quartiles": quartiles,
@@ -241,6 +264,8 @@ def parse_args():
                    help="Chunks per forward pass")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--confidence", type=float, default=0.95,
+                   help="Confidence level for intervals (default: 0.95)")
     return p.parse_args()
 
 
@@ -271,11 +296,22 @@ def main():
 
     model, saved_args = load_checkpoint(args.checkpoint, device)
 
-    results = run_evaluation(model, chunks, args.batch_size, device)
+    results = run_evaluation(model, chunks, args.batch_size, device, confidence=args.confidence)
 
-    print(f"\nOverall loss: {results['mean_loss']:.4f}  ppl: {results['mean_ppl']:.2f}")
+    ci = results["confidence"]
+    lo_l, hi_l = results["ci_loss"]
+    lo_p, hi_p = results["ci_ppl"]
+    print(
+        f"\nOverall  loss: {results['mean_loss']:.4f}  [{lo_l:.4f}, {hi_l:.4f}]  ({ci:.0%} CI)"
+        f"   ppl: {results['mean_ppl']:.2f}  [{lo_p:.2f}, {hi_p:.2f}]"
+    )
     for qk, qv in results["quartiles"].items():
-        print(f"  {qk}: loss={qv['mean_loss']:.4f}  ppl={qv['mean_ppl']:.2f}")
+        ql_lo, ql_hi = qv["ci_loss"]
+        qp_lo, qp_hi = qv["ci_ppl"]
+        print(
+            f"  {qk}: loss={qv['mean_loss']:.4f} [{ql_lo:.4f}, {ql_hi:.4f}]"
+            f"  ppl={qv['mean_ppl']:.2f} [{qp_lo:.2f}, {qp_hi:.2f}]"
+        )
 
     output = {
         "checkpoint": args.checkpoint,
